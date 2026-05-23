@@ -723,6 +723,36 @@
         return centered.map((p) => [p[0] * scale, p[1] * scale, p[2] * scale]);
       }
 
+      function hasCalib3d() {
+        return Boolean(cv.findEssentialMat && cv.recoverPose && cv.triangulatePoints);
+      }
+
+      function reconstructFromDisparity(pointsA, pointsB, width, height) {
+        const focal = Math.max(width, height) * 1.15;
+        const cx = width / 2;
+        const cy = height / 2;
+        const cloud = [];
+
+        for (let i = 0; i < pointsA.length; i += 2) {
+          const x1 = pointsA[i];
+          const y1 = pointsA[i + 1];
+          const x2 = pointsB[i];
+          const y2 = pointsB[i + 1];
+          const dx = x2 - x1;
+          const dy = y2 - y1;
+          const disparity = Math.hypot(dx, dy);
+
+          if (disparity < 2 || disparity > Math.max(width, height) * 0.32) continue;
+
+          const z = focal / disparity;
+          const x = ((x1 - cx) / focal) * z;
+          const y = ((y1 - cy) / focal) * z;
+          cloud.push([x, -y, -z]);
+        }
+
+        return normalizeCloud(cloud);
+      }
+
       function reconstruct(pointsA, pointsB, width, height) {
         const count = pointsA.length / 2;
         const pts1 = cv.matFromArray(count, 1, cv.CV_32FC2, pointsA);
@@ -818,10 +848,6 @@
             throw new Error("特徴点を十分に検出できませんでした。模様や輪郭が多い被写体で試してください。");
           }
 
-          if (!cv.findEssentialMat || !cv.recoverPose || !cv.triangulatePoints) {
-            throw new Error("このOpenCV.jsビルドにはSfMに必要なcalib3d関数が含まれていません。");
-          }
-
           logStep("BFMatcherで特徴点を対応付けています。");
           const matches = matchDescriptors(featuresA.descriptors, featuresB.descriptors);
           updateMetric(els.matchCount, matches.length);
@@ -830,11 +856,18 @@
             throw new Error("十分なマッチがありません。視差のある2枚を追加してください。");
           }
 
-          logStep("Essential Matrixからカメラ姿勢を推定しています。");
           const { pointsA, pointsB } = collectPoints(matches, featuresA.keypoints, featuresB.keypoints);
 
-          logStep("三角測量で3D点群を作成しています。");
-          const points = reconstruct(pointsA, pointsB, first.width, first.height);
+          let points;
+          if (hasCalib3d()) {
+            logStep("Essential Matrixからカメラ姿勢を推定しています。");
+            logStep("三角測量で3D点群を作成しています。");
+            points = reconstruct(pointsA, pointsB, first.width, first.height);
+          } else {
+            logStep("このOpenCV.jsにはcalib3dが無いため、視差ベースの簡易点群で表示します。");
+            points = reconstructFromDisparity(pointsA, pointsB, first.width, first.height);
+          }
+
           if (points.length < 8) {
             throw new Error("点群を安定して復元できませんでした。被写体を少し横から撮った2枚で試してください。");
           }
