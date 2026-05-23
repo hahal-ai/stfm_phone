@@ -1,0 +1,901 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mobile SfM Demo</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #111417;
+        color: #f2f5f4;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at top left, rgba(51, 131, 107, 0.24), transparent 34rem),
+          linear-gradient(135deg, #111417 0%, #1c2424 52%, #181716 100%);
+      }
+
+      button,
+      input,
+      video {
+        font: inherit;
+      }
+
+      .app-shell {
+        display: grid;
+        gap: 16px;
+        min-height: 100vh;
+        padding: 16px;
+      }
+
+      .panel {
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        background: rgba(18, 22, 23, 0.82);
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+      }
+
+      .controls {
+        display: grid;
+        gap: 14px;
+        padding: 16px;
+      }
+
+      .title-row {
+        display: flex;
+        align-items: start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      h1,
+      h2,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: clamp(1.45rem, 4vw, 2.35rem);
+        line-height: 1.05;
+      }
+
+      h2 {
+        font-size: 1rem;
+      }
+
+      p {
+        margin-top: 6px;
+        color: #aeb9b6;
+        font-size: 0.92rem;
+      }
+
+      .status {
+        flex: 0 0 auto;
+        border-radius: 999px;
+        padding: 6px 10px;
+        color: #101414;
+        font-size: 0.75rem;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
+      .status-wait {
+        background: #e7c66a;
+      }
+
+      .status-ready {
+        background: #6fe0a9;
+      }
+
+      .status-error {
+        background: #ff8f7e;
+      }
+
+      .camera-panel {
+        position: relative;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        background: #080b0c;
+        aspect-ratio: 16 / 9;
+      }
+
+      #cameraVideo {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        opacity: 0;
+      }
+
+      #cameraVideo.is-active {
+        opacity: 1;
+      }
+
+      .camera-placeholder {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: #9ca9a5;
+        font-weight: 700;
+        background:
+          linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+          linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+          #0b0f10;
+        background-size: 24px 24px;
+      }
+
+      .file-picker {
+        display: grid;
+        place-items: center;
+        min-height: 92px;
+        border: 1px dashed rgba(255, 255, 255, 0.28);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.05);
+        color: #f7fbf8;
+        font-weight: 700;
+      }
+
+      .file-picker input {
+        position: absolute;
+        inline-size: 1px;
+        block-size: 1px;
+        opacity: 0;
+      }
+
+      .actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+
+      .camera-actions {
+        grid-template-columns: 1fr 1fr 0.75fr;
+      }
+
+      button {
+        min-height: 44px;
+        border: 0;
+        border-radius: 8px;
+        background: #62d1a2;
+        color: #07110e;
+        font-weight: 800;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        background: #596360;
+        color: #c8d1ce;
+      }
+
+      #resetButton,
+      #stopCameraButton {
+        background: #303837;
+        color: #ecf2ef;
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        margin: 0;
+      }
+
+      .metrics div {
+        min-width: 0;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.06);
+        padding: 10px;
+      }
+
+      .metrics dt {
+        color: #9ca9a5;
+        font-size: 0.72rem;
+      }
+
+      .metrics dd {
+        margin: 4px 0 0;
+        font-size: 1.2rem;
+        font-weight: 800;
+      }
+
+      .workspace {
+        display: grid;
+        grid-template-rows: minmax(340px, 1fr) auto;
+        gap: 16px;
+        min-height: 0;
+      }
+
+      #viewer {
+        min-height: 340px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        background: #080b0c;
+      }
+
+      .log-panel {
+        max-height: 220px;
+        overflow: auto;
+        padding: 14px;
+      }
+
+      .log-panel ol {
+        display: grid;
+        gap: 8px;
+        margin: 10px 0 0;
+        padding-left: 1.25rem;
+        color: #c6d1cc;
+        font-size: 0.88rem;
+      }
+
+      .preview-strip {
+        display: grid;
+        grid-auto-flow: column;
+        grid-auto-columns: minmax(112px, 168px);
+        gap: 10px;
+        overflow-x: auto;
+        padding-bottom: 4px;
+      }
+
+      .preview-strip img {
+        width: 100%;
+        aspect-ratio: 4 / 3;
+        object-fit: cover;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        background: #202725;
+      }
+
+      @media (min-width: 900px) {
+        .app-shell {
+          grid-template-rows: auto 1fr auto;
+        }
+
+        .workspace {
+          grid-template-columns: minmax(0, 1fr) 320px;
+          grid-template-rows: minmax(420px, 1fr);
+        }
+
+        .log-panel {
+          max-height: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="panel controls">
+        <div class="title-row">
+          <div>
+            <h1>Structure from Motion</h1>
+            <p>スマホのカメラ映像からフレームを取り込み、特徴点を合わせて簡易点群を復元します。</p>
+          </div>
+          <span id="cvStatus" class="status status-wait">OpenCV loading</span>
+        </div>
+
+        <div class="camera-panel">
+          <video id="cameraVideo" playsinline autoplay muted></video>
+          <div id="cameraPlaceholder" class="camera-placeholder">カメラ映像</div>
+        </div>
+
+        <div class="actions camera-actions">
+          <button id="startCameraButton" type="button">カメラ開始</button>
+          <button id="captureFrameButton" type="button" disabled>フレーム追加</button>
+          <button id="stopCameraButton" type="button" disabled>停止</button>
+        </div>
+
+        <label class="file-picker">
+          <input id="imageInput" type="file" accept="image/*" capture="environment" multiple />
+          <span>写真を撮る / 選ぶ</span>
+        </label>
+
+        <div class="actions">
+          <button id="runButton" type="button" disabled>再構成</button>
+          <button id="resetButton" type="button">リセット</button>
+        </div>
+
+        <dl class="metrics">
+          <div>
+            <dt>入力画像</dt>
+            <dd id="imageCount">0</dd>
+          </div>
+          <div>
+            <dt>特徴点</dt>
+            <dd id="featureCount">0</dd>
+          </div>
+          <div>
+            <dt>マッチ</dt>
+            <dd id="matchCount">0</dd>
+          </div>
+          <div>
+            <dt>点群</dt>
+            <dd id="pointCount">0</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="workspace">
+        <div id="viewer" aria-label="3D point cloud viewer"></div>
+        <aside class="panel log-panel">
+          <h2>Processing</h2>
+          <ol id="logList"></ol>
+        </aside>
+      </section>
+
+      <section id="previewStrip" class="preview-strip" aria-label="Selected images"></section>
+    </main>
+
+    <canvas id="workCanvas" hidden></canvas>
+
+    <script src="https://docs.opencv.org/4.x/opencv.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script>
+      const els = {
+        cvStatus: document.querySelector("#cvStatus"),
+        imageInput: document.querySelector("#imageInput"),
+        startCameraButton: document.querySelector("#startCameraButton"),
+        captureFrameButton: document.querySelector("#captureFrameButton"),
+        stopCameraButton: document.querySelector("#stopCameraButton"),
+        cameraVideo: document.querySelector("#cameraVideo"),
+        cameraPlaceholder: document.querySelector("#cameraPlaceholder"),
+        runButton: document.querySelector("#runButton"),
+        resetButton: document.querySelector("#resetButton"),
+        imageCount: document.querySelector("#imageCount"),
+        featureCount: document.querySelector("#featureCount"),
+        matchCount: document.querySelector("#matchCount"),
+        pointCount: document.querySelector("#pointCount"),
+        previewStrip: document.querySelector("#previewStrip"),
+        logList: document.querySelector("#logList"),
+        workCanvas: document.querySelector("#workCanvas"),
+        viewer: document.querySelector("#viewer"),
+      };
+
+      const state = {
+        images: [],
+        mats: [],
+        cameraStream: null,
+        pointCloud: null,
+        renderer: null,
+        scene: null,
+        camera: null,
+        controls: null,
+      };
+
+      function logStep(text) {
+        const item = document.createElement("li");
+        item.textContent = text;
+        els.logList.prepend(item);
+      }
+
+      function setStatus(text, className) {
+        els.cvStatus.textContent = text;
+        els.cvStatus.className = `status ${className}`;
+      }
+
+      function updateMetric(el, value) {
+        el.textContent = value.toLocaleString("ja-JP");
+      }
+
+      function cvReady() {
+        return window.cv && typeof cv.Mat === "function" && typeof cv.ORB === "function";
+      }
+
+      function setRunState() {
+        els.runButton.disabled = !cvReady() || state.images.length < 2;
+      }
+
+      function setCameraState(active) {
+        els.startCameraButton.disabled = active;
+        els.captureFrameButton.disabled = !active;
+        els.stopCameraButton.disabled = !active;
+        els.cameraVideo.classList.toggle("is-active", active);
+        els.cameraPlaceholder.hidden = active;
+      }
+
+      function initOpenCv() {
+        if (!window.cv) {
+          setStatus("OpenCV error", "status-error");
+          return;
+        }
+
+        cv.onRuntimeInitialized = () => {
+          setStatus("OpenCV ready", "status-ready");
+          logStep("OpenCV.jsを初期化しました。");
+          setRunState();
+        };
+      }
+
+      function initThree() {
+        const width = els.viewer.clientWidth || 320;
+        const height = els.viewer.clientHeight || 340;
+
+        state.scene = new THREE.Scene();
+        state.scene.background = new THREE.Color(0x080b0c);
+
+        state.camera = new THREE.PerspectiveCamera(55, width / height, 0.01, 2000);
+        state.camera.position.set(0, 0.25, 4.2);
+
+        state.renderer = new THREE.WebGLRenderer({ antialias: true });
+        state.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        state.renderer.setSize(width, height);
+        els.viewer.appendChild(state.renderer.domElement);
+
+        state.controls = new THREE.OrbitControls(state.camera, state.renderer.domElement);
+        state.controls.enableDamping = true;
+
+        const grid = new THREE.GridHelper(4, 20, 0x2f6f61, 0x22302e);
+        grid.rotation.x = Math.PI / 2;
+        state.scene.add(grid);
+        state.scene.add(new THREE.AxesHelper(0.7));
+
+        const animate = () => {
+          requestAnimationFrame(animate);
+          state.controls.update();
+          state.renderer.render(state.scene, state.camera);
+        };
+        animate();
+      }
+
+      function resizeThree() {
+        if (!state.renderer) return;
+        const width = els.viewer.clientWidth || 320;
+        const height = els.viewer.clientHeight || 340;
+        state.camera.aspect = width / height;
+        state.camera.updateProjectionMatrix();
+        state.renderer.setSize(width, height);
+      }
+
+      function describeCameraError(error) {
+        if (!window.isSecureContext) {
+          return `カメラを開始できませんでした。現在の接続は${location.protocol}です。スマホではHTTPSで開く必要があります。`;
+        }
+        if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
+          return "カメラ権限が許可されていません。ブラウザのサイト設定でカメラを許可してください。";
+        }
+        if (error?.name === "NotFoundError" || error?.name === "DevicesNotFoundError") {
+          return "利用できるカメラが見つかりませんでした。別のブラウザで試してください。";
+        }
+        if (error?.name === "NotReadableError" || error?.name === "TrackStartError") {
+          return "カメラを他のアプリが使用中の可能性があります。カメラアプリや別タブを閉じて試してください。";
+        }
+        if (error?.name === "OverconstrainedError" || error?.name === "ConstraintNotSatisfiedError") {
+          return "指定したカメラ条件に合いませんでした。通常カメラで再試行してください。";
+        }
+        return `カメラを開始できませんでした。${error?.name || "UnknownError"}`;
+      }
+
+      async function startCamera() {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          logStep("このブラウザはカメラ入力に対応していません。");
+          return;
+        }
+
+        if (!window.isSecureContext) {
+          logStep(`カメラを開始できませんでした。現在の接続は${location.protocol}です。HTTPSで開いてください。`);
+          return;
+        }
+
+        try {
+          const preferredConstraints = {
+            audio: false,
+            video: {
+              facingMode: { ideal: "environment" },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+          };
+          try {
+            state.cameraStream = await navigator.mediaDevices.getUserMedia(preferredConstraints);
+          } catch (error) {
+            if (error?.name !== "OverconstrainedError" && error?.name !== "ConstraintNotSatisfiedError") {
+              throw error;
+            }
+            logStep("背面カメラ指定に失敗したため、通常カメラで再試行します。");
+            state.cameraStream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+          }
+          els.cameraVideo.srcObject = state.cameraStream;
+          await els.cameraVideo.play();
+          setCameraState(true);
+          logStep("スマホカメラの映像入力を開始しました。");
+        } catch (error) {
+          console.error(error);
+          logStep(describeCameraError(error));
+        }
+      }
+
+      function stopCamera() {
+        if (!state.cameraStream) return;
+        state.cameraStream.getTracks().forEach((track) => track.stop());
+        state.cameraStream = null;
+        els.cameraVideo.srcObject = null;
+        setCameraState(false);
+        logStep("カメラを停止しました。");
+      }
+
+      function renderPreviews() {
+        els.previewStrip.replaceChildren();
+        state.images.forEach(({ url, name }, index) => {
+          const image = document.createElement("img");
+          image.src = url;
+          image.alt = name || `frame ${index + 1}`;
+          els.previewStrip.appendChild(image);
+        });
+      }
+
+      function addImageToState(image, url, name) {
+        state.images.push({ image, url, name });
+        if (state.images.length > 6) {
+          const removed = state.images.shift();
+          URL.revokeObjectURL(removed.url);
+        }
+        renderPreviews();
+        updateMetric(els.imageCount, state.images.length);
+        setRunState();
+      }
+
+      function blobToImage(blob, name) {
+        return new Promise((resolve, reject) => {
+          const url = URL.createObjectURL(blob);
+          const image = new Image();
+          image.onload = () => resolve({ image, url, name });
+          image.onerror = () => {
+            URL.revokeObjectURL(url);
+            reject(new Error("画像を読み込めませんでした。"));
+          };
+          image.src = url;
+        });
+      }
+
+      async function captureFrame() {
+        const video = els.cameraVideo;
+        if (!state.cameraStream || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          logStep("カメラ映像の準備がまだできていません。");
+          return;
+        }
+
+        els.workCanvas.width = video.videoWidth;
+        els.workCanvas.height = video.videoHeight;
+        const ctx = els.workCanvas.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+
+        const blob = await new Promise((resolve) => els.workCanvas.toBlob(resolve, "image/jpeg", 0.9));
+        if (!blob) {
+          logStep("フレームの保存に失敗しました。");
+          return;
+        }
+
+        const frameNumber = state.images.length + 1;
+        const frame = await blobToImage(blob, `camera-frame-${frameNumber}.jpg`);
+        resetProcessing(false);
+        addImageToState(frame.image, frame.url, frame.name);
+        logStep(`カメラ映像から${frameNumber}枚目のフレームを追加しました。`);
+      }
+
+      function fileToImage(file) {
+        return blobToImage(file, file.name);
+      }
+
+      async function handleFiles(files) {
+        resetProcessing(false);
+        state.images.forEach(({ url }) => URL.revokeObjectURL(url));
+        state.images = await Promise.all([...files].slice(0, 6).map(fileToImage));
+        renderPreviews();
+        updateMetric(els.imageCount, state.images.length);
+        logStep(`${state.images.length}枚の画像を読み込みました。`);
+        setRunState();
+      }
+
+      function imageToMat(image) {
+        const maxSide = 960;
+        const sourceWidth = image.naturalWidth || image.width;
+        const sourceHeight = image.naturalHeight || image.height;
+        const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
+        const width = Math.max(1, Math.round(sourceWidth * scale));
+        const height = Math.max(1, Math.round(sourceHeight * scale));
+        els.workCanvas.width = width;
+        els.workCanvas.height = height;
+
+        const ctx = els.workCanvas.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(image, 0, 0, width, height);
+        const src = cv.imread(els.workCanvas);
+        const gray = new cv.Mat();
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        src.delete();
+        return { gray, width, height };
+      }
+
+      function extractFeatures(gray) {
+        const keypoints = new cv.KeyPointVector();
+        const descriptors = new cv.Mat();
+        const mask = new cv.Mat();
+        const orb = new cv.ORB(1800);
+        orb.detectAndCompute(gray, mask, keypoints, descriptors);
+        mask.delete();
+        orb.delete();
+        return { keypoints, descriptors };
+      }
+
+      function matchDescriptors(descA, descB) {
+        const matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
+        const matches = new cv.DMatchVector();
+        matcher.match(descA, descB, matches);
+        const sorted = [];
+        for (let i = 0; i < matches.size(); i += 1) {
+          sorted.push(matches.get(i));
+        }
+        matcher.delete();
+        matches.delete();
+        return sorted.sort((a, b) => a.distance - b.distance).slice(0, 500);
+      }
+
+      function collectPoints(matches, keypointsA, keypointsB) {
+        const pointsA = [];
+        const pointsB = [];
+        matches.forEach((match) => {
+          const a = keypointsA.get(match.queryIdx).pt;
+          const b = keypointsB.get(match.trainIdx).pt;
+          pointsA.push(a.x, a.y);
+          pointsB.push(b.x, b.y);
+        });
+        return { pointsA, pointsB };
+      }
+
+      function makeCameraMatrix(width, height) {
+        const focal = Math.max(width, height) * 1.15;
+        return cv.matFromArray(3, 3, cv.CV_64F, [
+          focal, 0, width / 2,
+          0, focal, height / 2,
+          0, 0, 1,
+        ]);
+      }
+
+      function mat2xN(points) {
+        const mat = new cv.Mat(2, points.length / 2, cv.CV_64F);
+        for (let i = 0; i < points.length / 2; i += 1) {
+          mat.doublePtr(0, i)[0] = points[i * 2];
+          mat.doublePtr(1, i)[0] = points[i * 2 + 1];
+        }
+        return mat;
+      }
+
+      function identityProjection(k) {
+        const rt = cv.matFromArray(3, 4, cv.CV_64F, [
+          1, 0, 0, 0,
+          0, 1, 0, 0,
+          0, 0, 1, 0,
+        ]);
+        const p = new cv.Mat();
+        const empty = new cv.Mat();
+        cv.gemm(k, rt, 1, empty, 0, p);
+        empty.delete();
+        rt.delete();
+        return p;
+      }
+
+      function projectionFromPose(k, r, t) {
+        const rt = cv.Mat.zeros(3, 4, cv.CV_64F);
+        for (let row = 0; row < 3; row += 1) {
+          for (let col = 0; col < 3; col += 1) {
+            rt.doublePtr(row, col)[0] = r.doubleAt(row, col);
+          }
+          rt.doublePtr(row, 3)[0] = t.doubleAt(row, 0);
+        }
+        const p = new cv.Mat();
+        const empty = new cv.Mat();
+        cv.gemm(k, rt, 1, empty, 0, p);
+        empty.delete();
+        rt.delete();
+        return p;
+      }
+
+      function normalizeCloud(points) {
+        if (!points.length) return points;
+        const center = [0, 0, 0];
+        points.forEach((p) => {
+          center[0] += p[0];
+          center[1] += p[1];
+          center[2] += p[2];
+        });
+        center[0] /= points.length;
+        center[1] /= points.length;
+        center[2] /= points.length;
+
+        let maxRadius = 0;
+        const centered = points.map((p) => {
+          const q = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+          maxRadius = Math.max(maxRadius, Math.hypot(q[0], q[1], q[2]));
+          return q;
+        });
+
+        const scale = maxRadius > 0 ? 1.8 / maxRadius : 1;
+        return centered.map((p) => [p[0] * scale, p[1] * scale, p[2] * scale]);
+      }
+
+      function reconstruct(pointsA, pointsB, width, height) {
+        const count = pointsA.length / 2;
+        const pts1 = cv.matFromArray(count, 1, cv.CV_32FC2, pointsA);
+        const pts2 = cv.matFromArray(count, 1, cv.CV_32FC2, pointsB);
+        const k = makeCameraMatrix(width, height);
+        const mask = new cv.Mat();
+        const r = new cv.Mat();
+        const t = new cv.Mat();
+        const cloud = [];
+
+        try {
+          const essential = cv.findEssentialMat(pts1, pts2, k, cv.RANSAC, 0.999, 1.0, mask);
+          cv.recoverPose(essential, pts1, pts2, k, r, t, mask);
+
+          const p1 = identityProjection(k);
+          const p2 = projectionFromPose(k, r, t);
+          const triA = mat2xN(pointsA);
+          const triB = mat2xN(pointsB);
+          const points4D = new cv.Mat();
+          cv.triangulatePoints(p1, p2, triA, triB, points4D);
+
+          for (let i = 0; i < points4D.cols; i += 1) {
+            if (mask.rows && mask.ucharAt(i, 0) === 0) continue;
+            const w = points4D.floatAt(3, i);
+            if (Math.abs(w) < 1e-6) continue;
+            const x = points4D.floatAt(0, i) / w;
+            const y = points4D.floatAt(1, i) / w;
+            const z = points4D.floatAt(2, i) / w;
+            if (Number.isFinite(x + y + z) && Math.abs(z) < 80) {
+              cloud.push([x, -y, -z]);
+            }
+          }
+
+          essential.delete();
+          p1.delete();
+          p2.delete();
+          triA.delete();
+          triB.delete();
+          points4D.delete();
+        } finally {
+          pts1.delete();
+          pts2.delete();
+          k.delete();
+          mask.delete();
+          r.delete();
+          t.delete();
+        }
+
+        return normalizeCloud(cloud);
+      }
+
+      function renderPointCloud(points) {
+        if (state.pointCloud) {
+          state.scene.remove(state.pointCloud);
+          state.pointCloud.geometry.dispose();
+          state.pointCloud.material.dispose();
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(points.flat());
+        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+
+        const material = new THREE.PointsMaterial({
+          size: 0.025,
+          color: 0x73e6b4,
+          sizeAttenuation: true,
+        });
+        state.pointCloud = new THREE.Points(geometry, material);
+        state.scene.add(state.pointCloud);
+        state.controls.target.set(0, 0, 0);
+        state.camera.position.set(0, 0.3, 4.2);
+      }
+
+      async function runSfM() {
+        if (state.images.length < 2) return;
+        els.runButton.disabled = true;
+        resetProcessing(false);
+        let featuresA = null;
+        let featuresB = null;
+
+        try {
+          logStep("画像をOpenCVのMatへ変換しています。");
+          const first = imageToMat(state.images[0].image);
+          const second = imageToMat(state.images[1].image);
+          state.mats.push(first.gray, second.gray);
+
+          logStep("ORBで特徴点と記述子を抽出しています。");
+          featuresA = extractFeatures(first.gray);
+          featuresB = extractFeatures(second.gray);
+          updateMetric(els.featureCount, featuresA.keypoints.size() + featuresB.keypoints.size());
+
+          if (featuresA.descriptors.rows === 0 || featuresB.descriptors.rows === 0) {
+            throw new Error("特徴点を十分に検出できませんでした。模様や輪郭が多い被写体で試してください。");
+          }
+
+          if (!cv.findEssentialMat || !cv.recoverPose || !cv.triangulatePoints) {
+            throw new Error("このOpenCV.jsビルドにはSfMに必要なcalib3d関数が含まれていません。");
+          }
+
+          logStep("BFMatcherで特徴点を対応付けています。");
+          const matches = matchDescriptors(featuresA.descriptors, featuresB.descriptors);
+          updateMetric(els.matchCount, matches.length);
+
+          if (matches.length < 24) {
+            throw new Error("十分なマッチがありません。視差のある2枚を追加してください。");
+          }
+
+          logStep("Essential Matrixからカメラ姿勢を推定しています。");
+          const { pointsA, pointsB } = collectPoints(matches, featuresA.keypoints, featuresB.keypoints);
+
+          logStep("三角測量で3D点群を作成しています。");
+          const points = reconstruct(pointsA, pointsB, first.width, first.height);
+          if (points.length < 8) {
+            throw new Error("点群を安定して復元できませんでした。被写体を少し横から撮った2枚で試してください。");
+          }
+
+          renderPointCloud(points);
+          updateMetric(els.pointCount, points.length);
+          logStep("three.jsへ点群を描画しました。");
+        } catch (error) {
+          console.error(error);
+          logStep(error.message || "再構成に失敗しました。");
+        } finally {
+          if (featuresA) {
+            featuresA.keypoints.delete();
+            featuresA.descriptors.delete();
+          }
+          if (featuresB) {
+            featuresB.keypoints.delete();
+            featuresB.descriptors.delete();
+          }
+          setRunState();
+        }
+      }
+
+      function resetProcessing(clearImages = true) {
+        state.mats.forEach((mat) => mat.delete());
+        state.mats = [];
+        updateMetric(els.featureCount, 0);
+        updateMetric(els.matchCount, 0);
+        updateMetric(els.pointCount, 0);
+        els.logList.replaceChildren();
+
+        if (state.pointCloud) {
+          state.scene.remove(state.pointCloud);
+          state.pointCloud.geometry.dispose();
+          state.pointCloud.material.dispose();
+          state.pointCloud = null;
+        }
+
+        if (clearImages) {
+          state.images.forEach(({ url }) => URL.revokeObjectURL(url));
+          state.images = [];
+          renderPreviews();
+          updateMetric(els.imageCount, 0);
+        }
+      }
+
+      els.imageInput.addEventListener("change", (event) => handleFiles(event.target.files));
+      els.startCameraButton.addEventListener("click", startCamera);
+      els.captureFrameButton.addEventListener("click", captureFrame);
+      els.stopCameraButton.addEventListener("click", stopCamera);
+      els.runButton.addEventListener("click", runSfM);
+      els.resetButton.addEventListener("click", () => {
+        resetProcessing(true);
+        setRunState();
+      });
+      window.addEventListener("resize", resizeThree);
+      window.addEventListener("pagehide", stopCamera);
+
+      setCameraState(false);
+      initThree();
+      initOpenCv();
+    </script>
+  </body>
+</html>
