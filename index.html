@@ -1152,11 +1152,13 @@
         const inliers   = new cv.Mat();
         const rMat      = new cv.Mat();
         let newPoseR = null, newPoseT = null, camPosThree = null;
+        let dbgInliers = 0;
 
         try {
           const ok = cv.solvePnPRansac(
             objPts, imgPts, k, distCoeffs, rvec, tvec, false, 100, 8.0, 0.99, inliers);
           if (!ok) return null;
+          dbgInliers = inliers.rows;
 
           // LM で姿勢を精細化（solvePnPRefineLM）
           try { cv.solvePnPRefineLM(objPts, imgPts, k, distCoeffs, rvec, tvec); } catch (_) {}
@@ -1245,6 +1247,7 @@
           },
           debug: {
             mapMatches: mapMatches.length,
+            inliers: dbgInliers,
             tvec: newPoseT.slice(),
           },
         };
@@ -1482,7 +1485,7 @@
             updateMetric(els.pointCount, result.cloud.length);
             updateMetric(els.matchCount, result.newSfmState.mapPts.length);
             const tv = result.debug.tvec;
-            logStep(`追跡 pos[${pos[0].toFixed(2)},${pos[1].toFixed(2)},${pos[2].toFixed(2)}] tvec[${tv[0].toFixed(2)},${tv[1].toFixed(2)},${tv[2].toFixed(2)}] mapMatch:${result.debug.mapMatches}`);
+            logStep(`追跡 pos[${pos[0].toFixed(4)},${pos[1].toFixed(4)},${pos[2].toFixed(4)}] tvec[${tv[0].toFixed(4)},${tv[1].toFixed(4)},${tv[2].toFixed(4)}] inliers:${result.debug.inliers}/${result.debug.mapMatches}`);
           }
 
         } catch (error) {
