@@ -173,7 +173,7 @@
       }
 
       .camera-actions {
-        grid-template-columns: 1fr 1fr 0.75fr;
+        grid-template-columns: 1fr 1fr 1fr 0.75fr;
       }
 
       button {
@@ -199,7 +199,7 @@
 
       .metrics {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(86px, 1fr));
         gap: 8px;
         margin: 0;
       }
@@ -304,6 +304,7 @@
 
         <div class="actions camera-actions">
           <button id="startCameraButton" type="button">カメラ開始</button>
+          <button id="autoScanButton" type="button" disabled>自動開始</button>
           <button id="captureFrameButton" type="button" disabled>フレーム追加</button>
           <button id="stopCameraButton" type="button" disabled>停止</button>
         </div>
@@ -335,6 +336,10 @@
             <dt>点群</dt>
             <dd id="pointCount">0</dd>
           </div>
+          <div>
+            <dt>推定位置</dt>
+            <dd id="poseValue">0.00</dd>
+          </div>
         </dl>
       </section>
 
@@ -359,6 +364,7 @@
         cvStatus: document.querySelector("#cvStatus"),
         imageInput: document.querySelector("#imageInput"),
         startCameraButton: document.querySelector("#startCameraButton"),
+        autoScanButton: document.querySelector("#autoScanButton"),
         captureFrameButton: document.querySelector("#captureFrameButton"),
         stopCameraButton: document.querySelector("#stopCameraButton"),
         cameraVideo: document.querySelector("#cameraVideo"),
@@ -370,6 +376,7 @@
         featureCount: document.querySelector("#featureCount"),
         matchCount: document.querySelector("#matchCount"),
         pointCount: document.querySelector("#pointCount"),
+        poseValue: document.querySelector("#poseValue"),
         previewStrip: document.querySelector("#previewStrip"),
         logList: document.querySelector("#logList"),
         workCanvas: document.querySelector("#workCanvas"),
@@ -381,6 +388,10 @@
         mats: [],
         cameraStream: null,
         cameraDrawHandle: 0,
+        autoScanTimer: 0,
+        autoScanBusy: false,
+        cameraPath: [[0, 0, 0]],
+        cameraPathGroup: null,
         pointCloud: null,
         renderer: null,
         scene: null,
@@ -413,6 +424,7 @@
 
       function setCameraState(active) {
         els.startCameraButton.disabled = active;
+        els.autoScanButton.disabled = !active;
         els.captureFrameButton.disabled = !active;
         els.stopCameraButton.disabled = !active;
         els.cameraVideo.classList.toggle("is-active", active);
@@ -420,11 +432,26 @@
         els.cameraPlaceholder.hidden = active;
       }
 
+      function setAutoScanState(active) {
+        els.autoScanButton.textContent = active ? "自動停止" : "自動開始";
+        els.captureFrameButton.disabled = active || !state.cameraStream;
+        els.startCameraButton.disabled = active || Boolean(state.cameraStream);
+      }
+
       function stopCameraPreview() {
         if (state.cameraDrawHandle) {
           cancelAnimationFrame(state.cameraDrawHandle);
           state.cameraDrawHandle = 0;
         }
+      }
+
+      function stopAutoScan() {
+        if (state.autoScanTimer) {
+          window.clearInterval(state.autoScanTimer);
+          state.autoScanTimer = 0;
+        }
+        state.autoScanBusy = false;
+        setAutoScanState(false);
       }
 
       function startCameraPreview() {
@@ -650,6 +677,7 @@
 
       function stopCamera() {
         const hadStream = Boolean(state.cameraStream);
+        stopAutoScan();
         stopCameraPreview();
         if (state.cameraStream) {
           state.cameraStream.getTracks().forEach((track) => track.stop());
@@ -696,11 +724,11 @@
         });
       }
 
-      async function captureFrame() {
+      async function captureFrame({ silent = false } = {}) {
         const video = els.cameraVideo;
         if (!state.cameraStream || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-          logStep("カメラ映像の準備がまだできていません。");
-          return;
+          if (!silent) logStep("カメラ映像の準備がまだできていません。");
+          return false;
         }
 
         const source = els.cameraCanvas.width > 0 ? els.cameraCanvas : video;
@@ -713,15 +741,47 @@
 
         const blob = await new Promise((resolve) => els.workCanvas.toBlob(resolve, "image/jpeg", 0.9));
         if (!blob) {
-          logStep("フレームの保存に失敗しました。");
-          return;
+          if (!silent) logStep("フレームの保存に失敗しました。");
+          return false;
         }
 
         const frameNumber = state.images.length + 1;
         const frame = await blobToImage(blob, `camera-frame-${frameNumber}.jpg`);
-        resetProcessing(false);
         addImageToState(frame.image, frame.url, frame.name);
-        logStep(`カメラ映像から${frameNumber}枚目のフレームを追加しました。`);
+        if (!silent) logStep(`カメラ映像から${frameNumber}枚目のフレームを追加しました。`);
+        return true;
+      }
+
+      async function autoScanTick() {
+        if (state.autoScanBusy) return;
+        state.autoScanBusy = true;
+        try {
+          const captured = await captureFrame({ silent: true });
+          if (captured && state.images.length >= 2) {
+            await runSfM({ auto: true });
+          }
+        } finally {
+          state.autoScanBusy = false;
+        }
+      }
+
+      async function toggleAutoScan() {
+        if (state.autoScanTimer) {
+          stopAutoScan();
+          logStep("自動撮影を停止しました。");
+          return;
+        }
+
+        if (!state.cameraStream) {
+          await startCamera();
+        }
+        if (!state.cameraStream) return;
+
+        resetProcessing(true);
+        setAutoScanState(true);
+        logStep("自動撮影と再構成を開始しました。スマホをゆっくり横に動かしてください。");
+        await autoScanTick();
+        state.autoScanTimer = window.setInterval(autoScanTick, 1800);
       }
 
       function fileToImage(file) {
@@ -791,6 +851,48 @@
           pointsB.push(b.x, b.y);
         });
         return { pointsA, pointsB };
+      }
+
+      function estimateCameraStep(pointsA, pointsB, width, height) {
+        let dxSum = 0;
+        let dySum = 0;
+        let disparitySum = 0;
+        let count = 0;
+
+        for (let i = 0; i < pointsA.length; i += 2) {
+          const dx = pointsB[i] - pointsA[i];
+          const dy = pointsB[i + 1] - pointsA[i + 1];
+          const disparity = Math.hypot(dx, dy);
+          if (disparity < 1.5 || disparity > Math.max(width, height) * 0.35) continue;
+          dxSum += dx;
+          dySum += dy;
+          disparitySum += disparity;
+          count += 1;
+        }
+
+        if (!count) return [0, 0, 0.08];
+
+        const dx = dxSum / count;
+        const dy = dySum / count;
+        const disparity = disparitySum / count;
+        const lateral = -dx / width;
+        const vertical = dy / height;
+        const forward = Math.min(0.28, Math.max(0.06, disparity / Math.max(width, height) * 2.2));
+        return [lateral * 2.4, vertical * 1.4, forward];
+      }
+
+      function addEstimatedCameraPose(step) {
+        const last = state.cameraPath[state.cameraPath.length - 1] || [0, 0, 0];
+        const next = [
+          last[0] + step[0],
+          last[1] + step[1],
+          last[2] + step[2],
+        ];
+        state.cameraPath.push(next);
+        if (state.cameraPath.length > 32) state.cameraPath.shift();
+        renderCameraPath();
+        els.poseValue.textContent = `${next[0].toFixed(2)}, ${next[2].toFixed(2)}`;
+        logStep(`推定位置 x:${next[0].toFixed(2)} y:${next[1].toFixed(2)} z:${next[2].toFixed(2)}`);
       }
 
       function makeCameraMatrix(width, height) {
@@ -967,17 +1069,52 @@
         state.camera.position.set(0, 0.3, 4.2);
       }
 
-      async function runSfM() {
+      function renderCameraPath() {
+        if (state.cameraPathGroup) {
+          state.scene.remove(state.cameraPathGroup);
+          state.cameraPathGroup.traverse((obj) => {
+            if (obj.geometry) obj.geometry.dispose();
+            if (obj.material) obj.material.dispose();
+          });
+        }
+
+        const group = new THREE.Group();
+        const positions = new Float32Array(state.cameraPath.flat());
+        const lineGeometry = new THREE.BufferGeometry();
+        lineGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        const line = new THREE.Line(
+          lineGeometry,
+          new THREE.LineBasicMaterial({ color: 0xff5f57 })
+        );
+        group.add(line);
+
+        const dotGeometry = new THREE.SphereGeometry(0.045, 12, 8);
+        state.cameraPath.forEach((pose, index) => {
+          const material = new THREE.MeshBasicMaterial({
+            color: index === state.cameraPath.length - 1 ? 0xffffff : 0xff5f57,
+          });
+          const dot = new THREE.Mesh(dotGeometry.clone(), material);
+          dot.position.set(pose[0], pose[1], pose[2]);
+          group.add(dot);
+        });
+
+        state.cameraPathGroup = group;
+        state.scene.add(group);
+      }
+
+      async function runSfM({ auto = false } = {}) {
         if (state.images.length < 2) return;
         els.runButton.disabled = true;
-        resetProcessing(false);
+        resetProcessing(false, !auto);
         let featuresA = null;
         let featuresB = null;
 
         try {
           logStep("画像をOpenCVのMatへ変換しています。");
-          const first = imageToMat(state.images[0].image);
-          const second = imageToMat(state.images[1].image);
+          const firstImage = state.images[state.images.length - 2].image;
+          const secondImage = state.images[state.images.length - 1].image;
+          const first = imageToMat(firstImage);
+          const second = imageToMat(secondImage);
           state.mats.push(first.gray, second.gray);
 
           logStep("ORBで特徴点と記述子を抽出しています。");
@@ -1014,6 +1151,7 @@
           }
 
           renderPointCloud(points);
+          addEstimatedCameraPose(estimateCameraStep(pointsA, pointsB, first.width, first.height));
           updateMetric(els.pointCount, points.length);
           logStep("three.jsへ点群を描画しました。");
         } catch (error) {
@@ -1032,13 +1170,13 @@
         }
       }
 
-      function resetProcessing(clearImages = true) {
+      function resetProcessing(clearImages = true, clearLog = true) {
         state.mats.forEach((mat) => mat.delete());
         state.mats = [];
         updateMetric(els.featureCount, 0);
         updateMetric(els.matchCount, 0);
         updateMetric(els.pointCount, 0);
-        els.logList.replaceChildren();
+        if (clearLog) els.logList.replaceChildren();
 
         if (state.pointCloud) {
           state.scene.remove(state.pointCloud);
@@ -1050,6 +1188,9 @@
         if (clearImages) {
           state.images.forEach(({ url }) => URL.revokeObjectURL(url));
           state.images = [];
+          state.cameraPath = [[0, 0, 0]];
+          renderCameraPath();
+          els.poseValue.textContent = "0.00";
           renderPreviews();
           updateMetric(els.imageCount, 0);
         }
@@ -1057,6 +1198,7 @@
 
       els.imageInput.addEventListener("change", (event) => handleFiles(event.target.files));
       els.startCameraButton.addEventListener("click", startCamera);
+      els.autoScanButton.addEventListener("click", toggleAutoScan);
       els.captureFrameButton.addEventListener("click", captureFrame);
       els.stopCameraButton.addEventListener("click", stopCamera);
       els.runButton.addEventListener("click", runSfM);
