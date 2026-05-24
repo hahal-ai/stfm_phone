@@ -1019,8 +1019,8 @@
         const cloud = [];
 
         try {
-          const essential = cv.findEssentialMat(pts1, pts2, k, cv.RANSAC, 0.999, 1.0, mask);
-          cv.recoverPose(essential, pts1, pts2, k, r, t, mask);
+          const essential = cv.findEssentialMat(pts1, pts2, k, cv.RANSAC, 0.999, 1.0, 1000, mask);
+          cv.recoverPose1(essential, pts1, pts2, k, r, t, mask);
 
           const p1 = identityProjection(k);
           const p2 = projectionFromPose(k, r, t);
