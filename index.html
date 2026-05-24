@@ -111,13 +111,7 @@
 
       #cameraVideo {
         position: absolute;
-        width: 1px;
-        height: 1px;
-        opacity: 0;
-        pointer-events: none;
-      }
-
-      #cameraCanvas {
+        inset: 0;
         display: block;
         width: 100%;
         height: 100%;
@@ -125,6 +119,17 @@
         opacity: 0;
       }
 
+      #cameraCanvas {
+        position: absolute;
+        inset: 0;
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        opacity: 0;
+      }
+
+      #cameraVideo.is-active,
       #cameraCanvas.is-active {
         opacity: 1;
       }
@@ -410,6 +415,7 @@
         els.startCameraButton.disabled = active;
         els.captureFrameButton.disabled = !active;
         els.stopCameraButton.disabled = !active;
+        els.cameraVideo.classList.toggle("is-active", active);
         els.cameraCanvas.classList.toggle("is-active", active);
         els.cameraPlaceholder.hidden = active;
       }
@@ -424,6 +430,7 @@
       function startCameraPreview() {
         stopCameraPreview();
         const ctx = els.cameraCanvas.getContext("2d", { willReadFrequently: true });
+        let announced = false;
         const draw = () => {
           const video = els.cameraVideo;
           if (!state.cameraStream || video.videoWidth === 0 || video.videoHeight === 0) {
@@ -436,6 +443,10 @@
             els.cameraCanvas.height = video.videoHeight;
           }
           ctx.drawImage(video, 0, 0, els.cameraCanvas.width, els.cameraCanvas.height);
+          if (!announced) {
+            announced = true;
+            logStep(`カメラ映像を描画中です。${video.videoWidth}x${video.videoHeight}`);
+          }
           state.cameraDrawHandle = requestAnimationFrame(draw);
         };
         draw();
@@ -538,6 +549,26 @@
         });
       }
 
+      function waitForVideoFrame(video) {
+        if (video.videoWidth > 0 && video.videoHeight > 0) return Promise.resolve();
+        return new Promise((resolve) => {
+          const done = () => {
+            cleanup();
+            resolve();
+          };
+          const cleanup = () => {
+            window.clearTimeout(timeout);
+            video.removeEventListener("loadedmetadata", done);
+            video.removeEventListener("loadeddata", done);
+            video.removeEventListener("canplay", done);
+          };
+          const timeout = window.setTimeout(done, 2500);
+          video.addEventListener("loadedmetadata", done, { once: true });
+          video.addEventListener("loadeddata", done, { once: true });
+          video.addEventListener("canplay", done, { once: true });
+        });
+      }
+
       async function requestCameraStream() {
         const attempts = [
           {
@@ -601,11 +632,15 @@
           els.cameraVideo.setAttribute("playsinline", "");
           els.cameraVideo.setAttribute("webkit-playsinline", "");
           els.cameraVideo.srcObject = state.cameraStream;
-          await waitForVideoMetadata(els.cameraVideo);
-          await els.cameraVideo.play();
           setCameraState(true);
           startCameraPreview();
-          logStep(`カメラ映像をcanvasへ表示しました。${els.cameraVideo.videoWidth}x${els.cameraVideo.videoHeight}`);
+          await els.cameraVideo.play();
+          await waitForVideoFrame(els.cameraVideo);
+          if (els.cameraVideo.videoWidth > 0) {
+            logStep(`video要素を再生しました。${els.cameraVideo.videoWidth}x${els.cameraVideo.videoHeight}`);
+          } else {
+            logStep("video要素は再生開始しましたが、映像サイズがまだ取得できません。");
+          }
         } catch (error) {
           console.error(error);
           stopCamera();
