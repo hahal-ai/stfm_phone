@@ -480,27 +480,47 @@
       }
 
       function initOpenCv() {
-        if (!window.cv) {
+        if (typeof window.cv === "undefined") {
           setStatus("OpenCV error", "status-error");
+          logStep("opencv.js が読み込まれていません。<script src=\"opencv.js\"> を確認してください。");
           return;
         }
 
         const onReady = (instance) => {
           if (instance) window.cv = instance; // Promise → 実インスタンスに差し替え
           setStatus("OpenCV ready", "status-ready");
-          logStep("OpenCV.jsを初期化しました。");
+          logStep(`OpenCV.jsを初期化しました。cv.Mat=${typeof cv.Mat} cv.imread=${typeof cv.imread} cv.findEssentialMat=${typeof cv.findEssentialMat}`);
           setRunState();
         };
 
-        if (typeof window.cv.then === "function") {
-          // MODULARIZE=1 ビルド: cv は Promise
-          window.cv.then(onReady).catch(() => setStatus("OpenCV error", "status-error"));
-        } else if (typeof window.cv.Mat === "function") {
-          // すでに初期化済み
-          onReady(null);
-        } else {
-          // 旧スタイル: onRuntimeInitialized を待つ
+        const fail = (label, error) => {
+          console.error("OpenCV init failed:", label, error);
+          setStatus("OpenCV error", "status-error");
+          logStep(`OpenCV初期化失敗(${label}): ${error && error.message ? error.message : error}`);
+        };
+
+        try {
+          // ケース1: window.cv が Promise（factory が自動実行されたパターン）
+          if (typeof window.cv.then === "function") {
+            logStep("OpenCV.js: Promise を待機中…");
+            window.cv.then(onReady).catch((e) => fail("promise", e));
+            return;
+          }
+          // ケース2: すでに初期化済み（cv.Mat が存在）
+          if (typeof window.cv.Mat === "function") {
+            onReady(null);
+            return;
+          }
+          // ケース3: ファクトリ関数（呼んで Promise を取得）
+          if (typeof window.cv === "function") {
+            logStep("OpenCV.js: ファクトリ関数を起動中…");
+            window.cv().then(onReady).catch((e) => fail("factory", e));
+            return;
+          }
+          // ケース4: 旧式 onRuntimeInitialized
           window.cv.onRuntimeInitialized = () => onReady(null);
+        } catch (e) {
+          fail("init", e);
         }
       }
 
