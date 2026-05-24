@@ -386,6 +386,7 @@
       const state = {
         images: [],
         mats: [],
+        sfm: null,          // solvePnP ランドマーク地図と姿勢
         cameraStream: null,
         cameraDrawHandle: 0,
         autoScanTimer: 0,
@@ -1002,6 +1003,250 @@
         return Boolean(cv.findEssentialMat && cv.recoverPose && cv.triangulatePoints);
       }
 
+      // ===== solvePnP インクリメンタル SfM =====
+
+      // cv.Mat (N×32, CV_8UC1) → Uint8Array[] (typed array のリスト)
+      function matsToDescs(mat) {
+        const data = mat.data; // Uint8Array ビュー
+        const cols = mat.cols;
+        const result = [];
+        for (let i = 0; i < mat.rows; i++) result.push(data.slice(i * cols, (i + 1) * cols));
+        return result;
+      }
+
+      // Uint8Array[] → cv.Mat (N×32, CV_8UC1)
+      function descsToMat(descs) {
+        const cols = descs[0].length;
+        const mat = new cv.Mat(descs.length, cols, cv.CV_8UC1);
+        const data = mat.data;
+        for (let i = 0; i < descs.length; i++) data.set(descs[i], i * cols);
+        return mat;
+      }
+
+      // cv.KeyPointVector → [[x, y], ...]
+      function kpsToArray(kpVec) {
+        const result = [];
+        for (let i = 0; i < kpVec.size(); i++) {
+          const p = kpVec.get(i).pt;
+          result.push([p.x, p.y]);
+        }
+        return result;
+      }
+
+      // BFMatcher+NORM_HAMMING で queryMat × trainMat をマッチ
+      // [{q, t, d}] を距離昇順で返す
+      function matchDescsMat(queryMat, trainMat, maxDist) {
+        const matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
+        const vec = new cv.DMatchVector();
+        matcher.match(queryMat, trainMat, vec);
+        const out = [];
+        for (let i = 0; i < vec.size(); i++) {
+          const m = vec.get(i);
+          if (m.distance <= maxDist) out.push({ q: m.queryIdx, t: m.trainIdx, d: m.distance });
+        }
+        matcher.delete();
+        vec.delete();
+        return out.sort((a, b) => a.d - b.d);
+      }
+
+      // 2フレームから SfM 地図を初期化する
+      // 戻り値: { mapPts, prevKps, prevDescs, poseR, poseT } または null
+      function sfmInitFromPair(featsA, featsB, width, height) {
+        const matches = matchDescriptors(featsA.descriptors, featsB.descriptors);
+        if (matches.length < 24) return null;
+
+        const { pointsA, pointsB } = collectPoints(matches, featsA.keypoints, featsB.keypoints);
+        const count = pointsA.length / 2;
+        const pts1 = cv.matFromArray(count, 1, cv.CV_32FC2, pointsA);
+        const pts2 = cv.matFromArray(count, 1, cv.CV_32FC2, pointsB);
+        const k = makeCameraMatrix(width, height);
+        const mask = new cv.Mat();
+        const r = new cv.Mat();
+        const t = new cv.Mat();
+        let sfmState = null;
+
+        try {
+          const E = cv.findEssentialMat(pts1, pts2, k, cv.RANSAC, 0.999, 1.0, 1000, mask);
+          const nInliers = cv.recoverPose1(E, pts1, pts2, k, r, t, mask);
+          E.delete();
+          if (nInliers < 8) return null;
+
+          const p1 = identityProjection(k);
+          const p2 = projectionFromPose(k, r, t);
+          const triA = mat2xN(pointsA);
+          const triB = mat2xN(pointsB);
+          const pts4D = new cv.Mat();
+          cv.triangulatePoints(p1, p2, triA, triB, pts4D);
+
+          const readAt = pts4D.type() === cv.CV_64F
+            ? (row, col) => pts4D.doubleAt(row, col)
+            : (row, col) => pts4D.floatAt(row, col);
+
+          const descB = matsToDescs(featsB.descriptors);
+          const mapPts = [];
+
+          for (let i = 0; i < pts4D.cols; i++) {
+            if (mask.rows && mask.ucharAt(i, 0) === 0) continue;
+            const w = readAt(3, i);
+            if (Math.abs(w) < 1e-6) continue;
+            const x = readAt(0, i) / w;
+            const y = readAt(1, i) / w;
+            const z = readAt(2, i) / w;
+            if (!Number.isFinite(x + y + z) || Math.abs(z) > 80) continue;
+            const bIdx = matches[i].trainIdx;
+            // OpenCV座標系のまま保存（表示時に Three.js 変換: [x, -y, -z]）
+            if (bIdx < descB.length) mapPts.push({ p: [x, y, z], d: descB[bIdx] });
+          }
+
+          p1.delete(); p2.delete(); triA.delete(); triB.delete(); pts4D.delete();
+
+          if (mapPts.length < 6) return null;
+
+          // frame B のカメラ姿勢（world = frame A 原点）
+          const poseR = [], poseT = [];
+          for (let row = 0; row < 3; row++) {
+            poseT.push(t.doubleAt(row, 0));
+            for (let col = 0; col < 3; col++) poseR.push(r.doubleAt(row, col));
+          }
+
+          sfmState = {
+            mapPts,
+            prevKps:   kpsToArray(featsB.keypoints),
+            prevDescs: matsToDescs(featsB.descriptors),
+            poseR,
+            poseT,
+          };
+        } finally {
+          pts1.delete(); pts2.delete(); k.delete(); mask.delete(); r.delete(); t.delete();
+        }
+
+        return sfmState;
+      }
+
+      // 新フレームを地図に対して solvePnP で位置特定し、新規点を三角測量で追加
+      // 戻り値: { camPosThree, cloud, newSfmState } または null
+      function sfmTrack(sfmState, featsC, width, height) {
+        const { mapPts, prevKps, prevDescs, poseR, poseT } = sfmState;
+        if (mapPts.length < 6) return null;
+
+        // 1. 現フレームの記述子を地図とマッチング
+        const mapDescMat = descsToMat(mapPts.map(p => p.d));
+        const mapMatches = matchDescsMat(featsC.descriptors, mapDescMat, 48);
+        mapDescMat.delete();
+        if (mapMatches.length < 6) return null;
+
+        const currentKps = kpsToArray(featsC.keypoints);
+        const objData = [], imgData = [];
+        mapMatches.forEach(m => {
+          const p = mapPts[m.t].p;
+          objData.push(p[0], p[1], p[2]);
+          imgData.push(currentKps[m.q][0], currentKps[m.q][1]);
+        });
+
+        const n = mapMatches.length;
+        const objPts    = cv.matFromArray(n, 1, cv.CV_64FC3, objData);
+        const imgPts    = cv.matFromArray(n, 1, cv.CV_32FC2, imgData);
+        const k         = makeCameraMatrix(width, height);
+        const distCoeffs = cv.Mat.zeros(4, 1, cv.CV_64F);
+        const rvec      = new cv.Mat();
+        const tvec      = new cv.Mat();
+        const inliers   = new cv.Mat();
+        const rMat      = new cv.Mat();
+        let newPoseR = null, newPoseT = null, camPosThree = null;
+
+        try {
+          const ok = cv.solvePnPRansac(
+            objPts, imgPts, k, distCoeffs, rvec, tvec, false, 100, 8.0, 0.99, inliers);
+          if (!ok) return null;
+
+          // LM で姿勢を精細化（solvePnPRefineLM）
+          try { cv.solvePnPRefineLM(objPts, imgPts, k, distCoeffs, rvec, tvec); } catch (_) {}
+
+          cv.Rodrigues(rvec, rMat);
+          newPoseR = [];
+          newPoseT = [];
+          for (let row = 0; row < 3; row++) {
+            newPoseT.push(tvec.doubleAt(row, 0));
+            for (let col = 0; col < 3; col++) newPoseR.push(rMat.doubleAt(row, col));
+          }
+
+          // カメラ中心（世界座標）= -R^T @ t → Three.js に変換 [x, -y, -z]
+          const R = newPoseR, tv = newPoseT;
+          const cx = -(R[0]*tv[0] + R[3]*tv[1] + R[6]*tv[2]);
+          const cy = -(R[1]*tv[0] + R[4]*tv[1] + R[7]*tv[2]);
+          const cz = -(R[2]*tv[0] + R[5]*tv[1] + R[8]*tv[2]);
+          camPosThree = [cx, -cy, -cz];
+        } finally {
+          objPts.delete(); imgPts.delete(); k.delete(); distCoeffs.delete();
+          rvec.delete(); tvec.delete(); inliers.delete(); rMat.delete();
+        }
+
+        if (!newPoseR) return null;
+
+        // 2. 前フレーム↔現フレーム間で新規ランドマークを三角測量
+        const k2       = makeCameraMatrix(width, height);
+        const prevRMat = cv.matFromArray(3, 3, cv.CV_64F, poseR);
+        const prevTMat = cv.matFromArray(3, 1, cv.CV_64F, poseT);
+        const newRMat  = cv.matFromArray(3, 3, cv.CV_64F, newPoseR);
+        const newTMat  = cv.matFromArray(3, 1, cv.CV_64F, newPoseT);
+        const p1 = projectionFromPose(k2, prevRMat, prevTMat);
+        const p2 = projectionFromPose(k2, newRMat,  newTMat);
+        prevRMat.delete(); prevTMat.delete(); newRMat.delete(); newTMat.delete(); k2.delete();
+
+        const prevDescMat = descsToMat(prevDescs);
+        const pcMatches   = matchDescsMat(featsC.descriptors, prevDescMat, 40);
+        prevDescMat.delete();
+
+        const newMapPts = [...mapPts];
+        const currentDescsArr = matsToDescs(featsC.descriptors);
+
+        if (pcMatches.length >= 8) {
+          const ptsA = [], ptsB = [];
+          pcMatches.forEach(m => {
+            ptsA.push(prevKps[m.t][0], prevKps[m.t][1]);
+            ptsB.push(currentKps[m.q][0], currentKps[m.q][1]);
+          });
+          const triPrev = mat2xN(ptsA);
+          const triCurr = mat2xN(ptsB);
+          const pts4D   = new cv.Mat();
+          try {
+            cv.triangulatePoints(p1, p2, triPrev, triCurr, pts4D);
+            const readAt = pts4D.type() === cv.CV_64F
+              ? (row, col) => pts4D.doubleAt(row, col)
+              : (row, col) => pts4D.floatAt(row, col);
+            for (let i = 0; i < pts4D.cols; i++) {
+              const w = readAt(3, i);
+              if (Math.abs(w) < 1e-6) continue;
+              const x = readAt(0, i) / w;
+              const y = readAt(1, i) / w;
+              const z = readAt(2, i) / w;
+              if (!Number.isFinite(x + y + z) || Math.abs(z) > 80) continue;
+              const cIdx = pcMatches[i].q;
+              if (cIdx < currentDescsArr.length) newMapPts.push({ p: [x, y, z], d: currentDescsArr[cIdx] });
+            }
+          } finally {
+            triPrev.delete(); triCurr.delete(); pts4D.delete();
+          }
+        }
+        p1.delete(); p2.delete();
+
+        // 地図サイズ上限（メモリ節約）
+        const MAX_MAP = 600;
+        if (newMapPts.length > MAX_MAP) newMapPts.splice(0, newMapPts.length - MAX_MAP);
+
+        return {
+          camPosThree,
+          cloud: newMapPts.map(p => [p.p[0], -p.p[1], -p.p[2]]), // Three.js 座標系
+          newSfmState: {
+            mapPts: newMapPts,
+            prevKps:   currentKps,
+            prevDescs: currentDescsArr,
+            poseR: newPoseR,
+            poseT: newPoseT,
+          },
+        };
+      }
+
       function reconstructFromDisparity(pointsA, pointsB, width, height) {
         const focal = Math.max(width, height) * 1.15;
         const cx = width / 2;
@@ -1142,67 +1387,99 @@
       async function runSfM({ auto = false } = {}) {
         if (state.images.length < 2) return;
         els.runButton.disabled = true;
-        resetProcessing(false, !auto);
-        let featuresA = null;
-        let featuresB = null;
+        if (!auto) els.logList.replaceChildren();
+
+        // mats は毎回クリーンアップ
+        state.mats.forEach((m) => m.delete());
+        state.mats = [];
+
+        let featsA = null;
+        let featsB = null;
 
         try {
-          logStep("画像をOpenCVのMatへ変換しています。");
-          const firstImage = state.images[state.images.length - 2].image;
-          const secondImage = state.images[state.images.length - 1].image;
-          const first = imageToMat(firstImage);
-          const second = imageToMat(secondImage);
-          state.mats.push(first.gray, second.gray);
+          const curImg = state.images[state.images.length - 1].image;
+          const cur    = imageToMat(curImg);
+          state.mats.push(cur.gray);
 
-          logStep("ORBで特徴点と記述子を抽出しています。");
-          featuresA = extractFeatures(first.gray);
-          featuresB = extractFeatures(second.gray);
-          updateMetric(els.featureCount, featuresA.keypoints.size() + featuresB.keypoints.size());
+          logStep("ORBで特徴点を抽出しています。");
+          featsB = extractFeatures(cur.gray);
+          updateMetric(els.featureCount, featsB.keypoints.size());
 
-          if (featuresA.descriptors.rows === 0 || featuresB.descriptors.rows === 0) {
-            throw new Error("特徴点を十分に検出できませんでした。模様や輪郭が多い被写体で試してください。");
+          if (featsB.descriptors.rows === 0) {
+            throw new Error("特徴点を検出できませんでした。模様や輪郭が多い被写体で試してください。");
           }
 
-          logStep("BFMatcherで特徴点を対応付けています。");
-          const matches = matchDescriptors(featuresA.descriptors, featuresB.descriptors);
-          updateMetric(els.matchCount, matches.length);
-
-          if (matches.length < 24) {
-            throw new Error("十分なマッチがありません。視差のある2枚を追加してください。");
+          if (!hasCalib3d()) {
+            // calib3d なし → 視差ベースフォールバック
+            const prevImg = state.images[state.images.length - 2].image;
+            const prev    = imageToMat(prevImg);
+            state.mats.push(prev.gray);
+            featsA = extractFeatures(prev.gray);
+            updateMetric(els.featureCount, featsA.keypoints.size() + featsB.keypoints.size());
+            const matches = matchDescriptors(featsA.descriptors, featsB.descriptors);
+            updateMetric(els.matchCount, matches.length);
+            if (matches.length < 24) throw new Error("十分なマッチがありません。視差のある2枚で試してください。");
+            const { pointsA, pointsB } = collectPoints(matches, featsA.keypoints, featsB.keypoints);
+            const points = reconstructFromDisparity(pointsA, pointsB, prev.width, prev.height);
+            if (points.length < 8) throw new Error("点群を復元できませんでした。");
+            renderPointCloud(points);
+            addEstimatedCameraPose(estimateCameraStep(pointsA, pointsB, prev.width, prev.height));
+            updateMetric(els.pointCount, points.length);
+            logStep("視差ベースで点群を描画しました（calib3d なし）。");
+            return;
           }
 
-          const { pointsA, pointsB } = collectPoints(matches, featuresA.keypoints, featuresB.keypoints);
+          if (!state.sfm) {
+            // ── 初期化: 2フレームから地図を構築 ──
+            const prevImg = state.images[state.images.length - 2].image;
+            const prev    = imageToMat(prevImg);
+            state.mats.push(prev.gray);
+            featsA = extractFeatures(prev.gray);
+            updateMetric(els.featureCount, featsA.keypoints.size() + featsB.keypoints.size());
 
-          let points;
-          if (hasCalib3d()) {
-            logStep("Essential Matrixからカメラ姿勢を推定しています。");
-            logStep("三角測量で3D点群を作成しています。");
-            points = reconstruct(pointsA, pointsB, first.width, first.height);
+            logStep("SfM地図を初期化しています…");
+            const sfmState = sfmInitFromPair(featsA, featsB, cur.width, cur.height);
+            if (!sfmState) throw new Error("初期化失敗: 特徴点か視差が不十分です。別の2枚で試してください。");
+
+            state.sfm = sfmState;
+            const initCloud = normalizeCloud(sfmState.mapPts.map(p => [p.p[0], -p.p[1], -p.p[2]]));
+            renderPointCloud(initCloud);
+            updateMetric(els.pointCount,  initCloud.length);
+            updateMetric(els.matchCount,  initCloud.length);
+            addEstimatedCameraPose([0, 0, 0.2]);
+            logStep(`地図初期化完了 ${initCloud.length}点。カメラを横に動かして次のフレームを追加してください。`);
+
           } else {
-            logStep("このOpenCV.jsにはcalib3dが無いため、視差ベースの簡易点群で表示します。");
-            points = reconstructFromDisparity(pointsA, pointsB, first.width, first.height);
+            // ── 追跡: solvePnP で絶対姿勢を推定 ──
+            const result = sfmTrack(state.sfm, featsB, cur.width, cur.height);
+
+            if (!result) {
+              logStep("トラッキング失敗: 地図をリセットして次回再初期化します。");
+              state.sfm = null;
+              return;
+            }
+
+            state.sfm = result.newSfmState;
+
+            // カメラパスを絶対座標で更新
+            const pos = result.camPosThree;
+            state.cameraPath.push(pos);
+            if (state.cameraPath.length > 32) state.cameraPath.shift();
+            renderCameraPath();
+            els.poseValue.textContent = `${pos[0].toFixed(2)}, ${pos[2].toFixed(2)}`;
+
+            renderPointCloud(result.cloud);
+            updateMetric(els.pointCount, result.cloud.length);
+            updateMetric(els.matchCount, result.newSfmState.mapPts.length);
+            logStep(`追跡 x:${pos[0].toFixed(2)} y:${pos[1].toFixed(2)} z:${pos[2].toFixed(2)} / 地図:${result.newSfmState.mapPts.length}点`);
           }
 
-          if (points.length < 8) {
-            throw new Error("点群を安定して復元できませんでした。被写体を少し横から撮った2枚で試してください。");
-          }
-
-          renderPointCloud(points);
-          addEstimatedCameraPose(estimateCameraStep(pointsA, pointsB, first.width, first.height));
-          updateMetric(els.pointCount, points.length);
-          logStep("three.jsへ点群を描画しました。");
         } catch (error) {
           console.error(error);
           logStep(error.message || "再構成に失敗しました。");
         } finally {
-          if (featuresA) {
-            featuresA.keypoints.delete();
-            featuresA.descriptors.delete();
-          }
-          if (featuresB) {
-            featuresB.keypoints.delete();
-            featuresB.descriptors.delete();
-          }
+          if (featsA) { featsA.keypoints.delete(); featsA.descriptors.delete(); }
+          if (featsB) { featsB.keypoints.delete(); featsB.descriptors.delete(); }
           setRunState();
         }
       }
@@ -1210,6 +1487,7 @@
       function resetProcessing(clearImages = true, clearLog = true) {
         state.mats.forEach((mat) => mat.delete());
         state.mats = [];
+        state.sfm = null;
         updateMetric(els.featureCount, 0);
         updateMetric(els.matchCount, 0);
         updateMetric(els.pointCount, 0);
