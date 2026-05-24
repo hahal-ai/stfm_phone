@@ -356,6 +356,22 @@
 
     <canvas id="workCanvas" hidden></canvas>
 
+    <!--
+      opencv.js の準備方法
+      =====================
+      このアプリは calib3d (findEssentialMat / recoverPose / triangulatePoints) を使う。
+      公式 CDN の opencv.js にはこれらが含まれていないため、自前ビルドが必要。
+
+      ビルド手順（Docker + Emscripten 3.1.57 推奨）:
+        1. opencv-4.x.x のソースを用意
+        2. modules/calib3d/misc/js/gen_dict.json に以下を追加:
+             "findEssentialMat", "recoverPose", "triangulatePoints",
+             "findFundamentalMat", "decomposeEssentialMat"
+        3. docker run --rm -v /path/to/opencv:/opencv emscripten/emsdk:3.1.57 \
+             python3 /opencv/platforms/js/build_js.py /build --build_wasm
+        4. build/bin/opencv.js をこのファイルと同じフォルダに置く
+           ※ opencv.js は UMD+WASM 単体ファイル（.wasm 別ファイルは不要）
+    -->
     <script src="opencv.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -480,6 +496,20 @@
       }
 
       function initOpenCv() {
+        /*
+          OpenCV.js の初期化パターン
+          --------------------------
+          ビルドオプション MODULARIZE=1（OpenCV 4.x デフォルト）の場合、
+          opencv.js は UMD ラッパーとして出力され、ブラウザ環境では
+            window.cv = factory()   ← factory() が Promise を返す
+          となる。つまり window.cv は cv インスタンスではなく Promise。
+
+          下記の try ブロックで 4 パターンを網羅する:
+            1. window.cv.then が関数 → Promise を .then() で待機
+            2. window.cv.Mat が関数 → すでに初期化済み（稀なケース）
+            3. window.cv が関数    → ファクトリ呼び出しが必要な旧ビルド
+            4. それ以外            → 旧式 onRuntimeInitialized を設定
+        */
         if (typeof window.cv === "undefined") {
           setStatus("OpenCV error", "status-error");
           logStep("opencv.js が読み込まれていません。<script src=\"opencv.js\"> を確認してください。");
@@ -500,25 +530,21 @@
         };
 
         try {
-          // ケース1: window.cv が Promise（factory が自動実行されたパターン）
-          if (typeof window.cv.then === "function") {
+          if (typeof window.cv.then === "function") {        // ケース1: Promise
             logStep("OpenCV.js: Promise を待機中…");
             window.cv.then(onReady).catch((e) => fail("promise", e));
             return;
           }
-          // ケース2: すでに初期化済み（cv.Mat が存在）
-          if (typeof window.cv.Mat === "function") {
+          if (typeof window.cv.Mat === "function") {         // ケース2: 初期化済み
             onReady(null);
             return;
           }
-          // ケース3: ファクトリ関数（呼んで Promise を取得）
-          if (typeof window.cv === "function") {
+          if (typeof window.cv === "function") {             // ケース3: ファクトリ関数
             logStep("OpenCV.js: ファクトリ関数を起動中…");
             window.cv().then(onReady).catch((e) => fail("factory", e));
             return;
           }
-          // ケース4: 旧式 onRuntimeInitialized
-          window.cv.onRuntimeInitialized = () => onReady(null);
+          window.cv.onRuntimeInitialized = () => onReady(null); // ケース4: 旧式
         } catch (e) {
           fail("init", e);
         }
@@ -1029,6 +1055,24 @@
       }
 
       function reconstruct(pointsA, pointsB, width, height) {
+        /*
+          OpenCV 4.12 JS バインディングの注意点
+          --------------------------------------
+          【findEssentialMat】
+            第7引数に maxIters=1000 が追加された（OpenCV 4.x で変更）。
+            mask は第8引数。旧コードで第7引数に mask を渡すと "invalid argument" エラー。
+            正: cv.findEssentialMat(pts1, pts2, k, cv.RANSAC, 0.999, 1.0, 1000, mask)
+
+          【recoverPose】
+            7引数版（mask 付き）は OpenCV 4.12 JS では recoverPose1 にリネームされた。
+            recoverPose(...7引数) を呼ぶと "invalid number of arguments" エラー。
+            正: cv.recoverPose1(essential, pts1, pts2, k, r, t, mask)
+
+          【triangulatePoints の出力型】
+            入力行列が CV_64F の場合、出力 points4D も CV_64F になる。
+            floatAt() で読むとゴミ値になるため doubleAt() を使う。
+            型チェックして自動選択（下記 readAt）。
+        */
         const count = pointsA.length / 2;
         const pts1 = cv.matFromArray(count, 1, cv.CV_32FC2, pointsA);
         const pts2 = cv.matFromArray(count, 1, cv.CV_32FC2, pointsB);
@@ -1039,18 +1083,19 @@
         const cloud = [];
 
         try {
+          // maxIters=1000 を第7引数に明示する（OpenCV 4.12 の新しいシグネチャ）
           const essential = cv.findEssentialMat(pts1, pts2, k, cv.RANSAC, 0.999, 1.0, 1000, mask);
+          // 7引数版は recoverPose1（OpenCV 4.12 JS バインディングでリネーム）
           cv.recoverPose1(essential, pts1, pts2, k, r, t, mask);
 
           const p1 = identityProjection(k);
           const p2 = projectionFromPose(k, r, t);
-          const triA = mat2xN(pointsA);
+          const triA = mat2xN(pointsA); // CV_64F の 2×N 行列
           const triB = mat2xN(pointsB);
           const points4D = new cv.Mat();
           cv.triangulatePoints(p1, p2, triA, triB, points4D);
 
-          // p1, p2, triA, triB は CV_64F で作っているので points4D も CV_64F
-          // 万一型が変わっても安全に読めるように doubleAt を優先しつつ float fallback
+          // 入力が CV_64F なので出力も CV_64F → doubleAt で読む（floatAt だとゴミ値）
           const readAt = points4D.type() === cv.CV_64F
             ? (row, col) => points4D.doubleAt(row, col)
             : (row, col) => points4D.floatAt(row, col);
