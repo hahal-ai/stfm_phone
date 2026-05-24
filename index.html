@@ -1330,6 +1330,8 @@
       }
 
       function renderPointCloud(points) {
+        const isFirst = !state.pointCloud;
+
         if (state.pointCloud) {
           state.scene.remove(state.pointCloud);
           state.pointCloud.geometry.dispose();
@@ -1347,8 +1349,12 @@
         });
         state.pointCloud = new THREE.Points(geometry, material);
         state.scene.add(state.pointCloud);
-        state.controls.target.set(0, 0, 0);
-        state.camera.position.set(0, 0.3, 4.2);
+
+        // 初回だけカメラをリセット。2回目以降はユーザーの視点を維持する
+        if (isFirst) {
+          state.controls.target.set(0, 0, 0);
+          state.camera.position.set(0, 0.3, 4.2);
+        }
       }
 
       function renderCameraPath() {
@@ -1468,7 +1474,7 @@
             renderCameraPath();
             els.poseValue.textContent = `${pos[0].toFixed(2)}, ${pos[2].toFixed(2)}`;
 
-            renderPointCloud(result.cloud);
+            renderPointCloud(normalizeCloud(result.cloud));
             updateMetric(els.pointCount, result.cloud.length);
             updateMetric(els.matchCount, result.newSfmState.mapPts.length);
             logStep(`追跡 x:${pos[0].toFixed(2)} y:${pos[1].toFixed(2)} z:${pos[2].toFixed(2)} / 地図:${result.newSfmState.mapPts.length}点`);
