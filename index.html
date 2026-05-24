@@ -1243,6 +1243,10 @@
             poseR: newPoseR,
             poseT: newPoseT,
           },
+          debug: {
+            mapMatches: mapMatches.length,
+            tvec: newPoseT.slice(),
+          },
         };
       }
 
@@ -1477,7 +1481,8 @@
             renderPointCloud(normalizeCloud(result.cloud));
             updateMetric(els.pointCount, result.cloud.length);
             updateMetric(els.matchCount, result.newSfmState.mapPts.length);
-            logStep(`追跡 x:${pos[0].toFixed(2)} y:${pos[1].toFixed(2)} z:${pos[2].toFixed(2)} / 地図:${result.newSfmState.mapPts.length}点`);
+            const tv = result.debug.tvec;
+            logStep(`追跡 pos[${pos[0].toFixed(2)},${pos[1].toFixed(2)},${pos[2].toFixed(2)}] tvec[${tv[0].toFixed(2)},${tv[1].toFixed(2)},${tv[2].toFixed(2)}] mapMatch:${result.debug.mapMatches}`);
           }
 
         } catch (error) {
