@@ -211,7 +211,7 @@
 
       .workspace {
         display: grid;
-        grid-template-rows: minmax(340px, 1fr) auto;
+        grid-template-rows: auto minmax(340px, 1fr);
         gap: 16px;
         min-height: 0;
       }
@@ -263,12 +263,11 @@
         }
 
         .workspace {
-          grid-template-columns: minmax(0, 1fr) 320px;
-          grid-template-rows: minmax(420px, 1fr);
+          grid-template-rows: auto minmax(420px, 1fr);
         }
 
         .log-panel {
-          max-height: none;
+          max-height: 220px;
         }
       }
     </style>
@@ -325,15 +324,15 @@
         </dl>
       </section>
 
+      <section id="previewStrip" class="preview-strip" aria-label="Selected images"></section>
+
       <section class="workspace">
-        <div id="viewer" aria-label="3D point cloud viewer"></div>
         <aside class="panel log-panel">
           <h2>Processing</h2>
           <ol id="logList"></ol>
         </aside>
+        <div id="viewer" aria-label="3D point cloud viewer"></div>
       </section>
-
-      <section id="previewStrip" class="preview-strip" aria-label="Selected images"></section>
     </main>
 
     <canvas id="workCanvas" hidden></canvas>
@@ -476,6 +475,75 @@
         return `カメラを開始できませんでした。${error?.name || "UnknownError"}`;
       }
 
+      function waitForVideoMetadata(video) {
+        if (video.videoWidth > 0 && video.videoHeight > 0) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+          const cleanup = () => {
+            window.clearTimeout(timeout);
+            video.removeEventListener("loadedmetadata", onLoaded);
+            video.removeEventListener("error", onError);
+          };
+          const onLoaded = () => {
+            cleanup();
+            resolve();
+          };
+          const onError = () => {
+            cleanup();
+            reject(new Error("VideoElementError"));
+          };
+          const timeout = window.setTimeout(() => {
+            cleanup();
+            reject(new Error("VideoMetadataTimeout"));
+          }, 6000);
+          video.addEventListener("loadedmetadata", onLoaded, { once: true });
+          video.addEventListener("error", onError, { once: true });
+        });
+      }
+
+      async function requestCameraStream() {
+        const attempts = [
+          {
+            label: "背面カメラ",
+            constraints: {
+              audio: false,
+              video: {
+                facingMode: { exact: "environment" },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+              },
+            },
+          },
+          {
+            label: "背面カメラ候補",
+            constraints: {
+              audio: false,
+              video: {
+                facingMode: { ideal: "environment" },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+              },
+            },
+          },
+          {
+            label: "通常カメラ",
+            constraints: { audio: false, video: true },
+          },
+        ];
+
+        let lastError = null;
+        for (const attempt of attempts) {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia(attempt.constraints);
+            logStep(`${attempt.label}を取得しました。`);
+            return stream;
+          } catch (error) {
+            lastError = error;
+            if (error?.name === "NotAllowedError" || error?.name === "SecurityError") throw error;
+          }
+        }
+        throw lastError || new Error("CameraStreamError");
+      }
+
       async function startCamera() {
         if (!navigator.mediaDevices?.getUserMedia) {
           logStep("このブラウザはカメラ入力に対応していません。");
@@ -488,29 +556,20 @@
         }
 
         try {
-          const preferredConstraints = {
-            audio: false,
-            video: {
-              facingMode: { ideal: "environment" },
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-            },
-          };
-          try {
-            state.cameraStream = await navigator.mediaDevices.getUserMedia(preferredConstraints);
-          } catch (error) {
-            if (error?.name !== "OverconstrainedError" && error?.name !== "ConstraintNotSatisfiedError") {
-              throw error;
-            }
-            logStep("背面カメラ指定に失敗したため、通常カメラで再試行します。");
-            state.cameraStream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
-          }
+          stopCamera();
+          state.cameraStream = await requestCameraStream();
+          els.cameraVideo.muted = true;
+          els.cameraVideo.playsInline = true;
+          els.cameraVideo.setAttribute("playsinline", "");
+          els.cameraVideo.setAttribute("webkit-playsinline", "");
           els.cameraVideo.srcObject = state.cameraStream;
+          await waitForVideoMetadata(els.cameraVideo);
           await els.cameraVideo.play();
           setCameraState(true);
-          logStep("スマホカメラの映像入力を開始しました。");
+          logStep(`カメラ映像を表示しました。${els.cameraVideo.videoWidth}x${els.cameraVideo.videoHeight}`);
         } catch (error) {
           console.error(error);
+          stopCamera();
           logStep(describeCameraError(error));
         }
       }
