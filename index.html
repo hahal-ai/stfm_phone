@@ -1067,9 +1067,8 @@
 
         try {
           const E = cv.findEssentialMat(pts1, pts2, k, cv.RANSAC, 0.999, 1.0, 1000, mask);
-          const nInliers = cv.recoverPose1(E, pts1, pts2, k, r, t, mask);
+          cv.recoverPose1(E, pts1, pts2, k, r, t, mask);
           E.delete();
-          if (nInliers < 8) return null;
 
           const p1 = identityProjection(k);
           const p2 = projectionFromPose(k, r, t);
@@ -1443,7 +1442,8 @@
             featsA = extractFeatures(prev.gray);
             updateMetric(els.featureCount, featsA.keypoints.size() + featsB.keypoints.size());
 
-            logStep("SfM地図を初期化しています…");
+            const matchCount0 = matchDescriptors(featsA.descriptors, featsB.descriptors).length;
+            logStep(`SfM地図を初期化しています… (マッチ数: ${matchCount0})`);
             const sfmState = sfmInitFromPair(featsA, featsB, cur.width, cur.height);
             if (!sfmState) throw new Error("初期化失敗: 特徴点か視差が不十分です。別の2枚で試してください。");
 
