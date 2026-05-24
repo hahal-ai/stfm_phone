@@ -110,6 +110,14 @@
       }
 
       #cameraVideo {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      #cameraCanvas {
         display: block;
         width: 100%;
         height: 100%;
@@ -117,7 +125,7 @@
         opacity: 0;
       }
 
-      #cameraVideo.is-active {
+      #cameraCanvas.is-active {
         opacity: 1;
       }
 
@@ -285,6 +293,7 @@
 
         <div class="camera-panel">
           <video id="cameraVideo" playsinline autoplay muted></video>
+          <canvas id="cameraCanvas"></canvas>
           <div id="cameraPlaceholder" class="camera-placeholder">カメラ映像</div>
         </div>
 
@@ -348,6 +357,7 @@
         captureFrameButton: document.querySelector("#captureFrameButton"),
         stopCameraButton: document.querySelector("#stopCameraButton"),
         cameraVideo: document.querySelector("#cameraVideo"),
+        cameraCanvas: document.querySelector("#cameraCanvas"),
         cameraPlaceholder: document.querySelector("#cameraPlaceholder"),
         runButton: document.querySelector("#runButton"),
         resetButton: document.querySelector("#resetButton"),
@@ -365,6 +375,7 @@
         images: [],
         mats: [],
         cameraStream: null,
+        cameraDrawHandle: 0,
         pointCloud: null,
         renderer: null,
         scene: null,
@@ -399,8 +410,35 @@
         els.startCameraButton.disabled = active;
         els.captureFrameButton.disabled = !active;
         els.stopCameraButton.disabled = !active;
-        els.cameraVideo.classList.toggle("is-active", active);
+        els.cameraCanvas.classList.toggle("is-active", active);
         els.cameraPlaceholder.hidden = active;
+      }
+
+      function stopCameraPreview() {
+        if (state.cameraDrawHandle) {
+          cancelAnimationFrame(state.cameraDrawHandle);
+          state.cameraDrawHandle = 0;
+        }
+      }
+
+      function startCameraPreview() {
+        stopCameraPreview();
+        const ctx = els.cameraCanvas.getContext("2d", { willReadFrequently: true });
+        const draw = () => {
+          const video = els.cameraVideo;
+          if (!state.cameraStream || video.videoWidth === 0 || video.videoHeight === 0) {
+            state.cameraDrawHandle = requestAnimationFrame(draw);
+            return;
+          }
+
+          if (els.cameraCanvas.width !== video.videoWidth || els.cameraCanvas.height !== video.videoHeight) {
+            els.cameraCanvas.width = video.videoWidth;
+            els.cameraCanvas.height = video.videoHeight;
+          }
+          ctx.drawImage(video, 0, 0, els.cameraCanvas.width, els.cameraCanvas.height);
+          state.cameraDrawHandle = requestAnimationFrame(draw);
+        };
+        draw();
       }
 
       function initOpenCv() {
@@ -566,7 +604,8 @@
           await waitForVideoMetadata(els.cameraVideo);
           await els.cameraVideo.play();
           setCameraState(true);
-          logStep(`カメラ映像を表示しました。${els.cameraVideo.videoWidth}x${els.cameraVideo.videoHeight}`);
+          startCameraPreview();
+          logStep(`カメラ映像をcanvasへ表示しました。${els.cameraVideo.videoWidth}x${els.cameraVideo.videoHeight}`);
         } catch (error) {
           console.error(error);
           stopCamera();
@@ -575,12 +614,17 @@
       }
 
       function stopCamera() {
-        if (!state.cameraStream) return;
-        state.cameraStream.getTracks().forEach((track) => track.stop());
+        const hadStream = Boolean(state.cameraStream);
+        stopCameraPreview();
+        if (state.cameraStream) {
+          state.cameraStream.getTracks().forEach((track) => track.stop());
+        }
         state.cameraStream = null;
         els.cameraVideo.srcObject = null;
         setCameraState(false);
-        logStep("カメラを停止しました。");
+        if (hadStream) {
+          logStep("カメラを停止しました。");
+        }
       }
 
       function renderPreviews() {
@@ -624,10 +668,13 @@
           return;
         }
 
-        els.workCanvas.width = video.videoWidth;
-        els.workCanvas.height = video.videoHeight;
+        const source = els.cameraCanvas.width > 0 ? els.cameraCanvas : video;
+        const width = source.width || video.videoWidth;
+        const height = source.height || video.videoHeight;
+        els.workCanvas.width = width;
+        els.workCanvas.height = height;
         const ctx = els.workCanvas.getContext("2d", { willReadFrequently: true });
-        ctx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+        ctx.drawImage(source, 0, 0, width, height);
 
         const blob = await new Promise((resolve) => els.workCanvas.toBlob(resolve, "image/jpeg", 0.9));
         if (!blob) {
