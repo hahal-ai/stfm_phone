@@ -485,11 +485,23 @@
           return;
         }
 
-        cv.onRuntimeInitialized = () => {
+        const onReady = (instance) => {
+          if (instance) window.cv = instance; // Promise → 実インスタンスに差し替え
           setStatus("OpenCV ready", "status-ready");
           logStep("OpenCV.jsを初期化しました。");
           setRunState();
         };
+
+        if (typeof window.cv.then === "function") {
+          // MODULARIZE=1 ビルド: cv は Promise
+          window.cv.then(onReady).catch(() => setStatus("OpenCV error", "status-error"));
+        } else if (typeof window.cv.Mat === "function") {
+          // すでに初期化済み
+          onReady(null);
+        } else {
+          // 旧スタイル: onRuntimeInitialized を待つ
+          window.cv.onRuntimeInitialized = () => onReady(null);
+        }
       }
 
       function initThree() {
