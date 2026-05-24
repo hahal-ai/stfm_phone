@@ -1049,8 +1049,146 @@
         return out.sort((a, b) => a.d - b.d);
       }
 
-      // 2フレームから SfM 地図を初期化する
-      // 戻り値: { mapPts, prevKps, prevDescs, poseR, poseT } または null
+      // === Bundle Adjustment 用ヘルパー ===
+      const SFM_KF_WINDOW = 5;       // スライディングウィンドウのキーフレーム数
+      const SFM_MAX_LANDMARKS = 800; // 地図の上限点数
+      const BA_ITERATIONS = 2;        // BAの反復回数（交互最適化）
+
+      // K (3x3) フラット配列を作る
+      function makeKArray(width, height) {
+        const f = Math.max(width, height) * 1.15;
+        return [f, 0, width / 2, 0, f, height / 2, 0, 0, 1];
+      }
+
+      // 投影行列 P = K * [R | t] をフラット 12 要素（行優先 3x4）で返す
+      function makeProjArray(kArr, R, t) {
+        const P = new Array(12);
+        for (let i = 0; i < 3; i++) {
+          for (let j = 0; j < 4; j++) {
+            let sum = 0;
+            for (let l = 0; l < 3; l++) {
+              const Kil = kArr[i * 3 + l];
+              const Rlj = j < 3 ? R[l * 3 + j] : t[l];
+              sum += Kil * Rlj;
+            }
+            P[i * 4 + j] = sum;
+          }
+        }
+        return P;
+      }
+
+      // 姿勢 (R, t) からカメラ中心（世界座標）を計算: c = -R^T @ t
+      function poseToCamCenter(R, t) {
+        return [
+          -(R[0]*t[0] + R[3]*t[1] + R[6]*t[2]),
+          -(R[1]*t[0] + R[4]*t[1] + R[7]*t[2]),
+          -(R[2]*t[0] + R[5]*t[1] + R[8]*t[2]),
+        ];
+      }
+
+      // 多視点三角測量（DLT, SVD不要）
+      // views: [{P: [12], pt: [u,v]}, ...] → [x, y, z] または null
+      // 各観測 i について制約: (u*P[2,:] - P[0,:]) @ [x,y,z,1] = 0 など
+      // X[3]=1 として正規方程式 (A^T A) X = A^T b を cv.solve で解く
+      function triangulateMultiView(views) {
+        const K = views.length;
+        if (K < 2) return null;
+
+        const AtA = new Float64Array(9);
+        const Atb = new Float64Array(3);
+
+        for (let i = 0; i < K; i++) {
+          const P = views[i].P;
+          const u = views[i].pt[0];
+          const v = views[i].pt[1];
+
+          const a0 = u * P[8]  - P[0], a1 = u * P[9]  - P[1], a2 = u * P[10] - P[2];
+          const c  = -(u * P[11] - P[3]);
+          const b0 = v * P[8]  - P[4], b1 = v * P[9]  - P[5], b2 = v * P[10] - P[6];
+          const d  = -(v * P[11] - P[7]);
+
+          AtA[0] += a0*a0 + b0*b0; AtA[1] += a0*a1 + b0*b1; AtA[2] += a0*a2 + b0*b2;
+          AtA[3] += a1*a0 + b1*b0; AtA[4] += a1*a1 + b1*b1; AtA[5] += a1*a2 + b1*b2;
+          AtA[6] += a2*a0 + b2*b0; AtA[7] += a2*a1 + b2*b1; AtA[8] += a2*a2 + b2*b2;
+          Atb[0] += a0*c + b0*d; Atb[1] += a1*c + b1*d; Atb[2] += a2*c + b2*d;
+        }
+
+        const AtAMat = cv.matFromArray(3, 3, cv.CV_64F, Array.from(AtA));
+        const AtbMat = cv.matFromArray(3, 1, cv.CV_64F, Array.from(Atb));
+        const X = new cv.Mat();
+        let result = null;
+        try {
+          if (cv.solve(AtAMat, AtbMat, X, cv.DECOMP_LU)) {
+            const x = X.doubleAt(0, 0);
+            const y = X.doubleAt(1, 0);
+            const z = X.doubleAt(2, 0);
+            if (Number.isFinite(x + y + z)) result = [x, y, z];
+          }
+        } catch (_) {}
+        AtAMat.delete(); AtbMat.delete(); X.delete();
+        return result;
+      }
+
+      // Bundle Adjustment（交互最適化）
+      // Step A: 全姿勢を固定 → 各ランドマークを多視点で再三角測量
+      // Step B: 全ランドマークを固定 → 非アンカーフレームを solvePnPRefineLM で再推定
+      function bundleAdjust(sfm, iterations) {
+        for (let iter = 0; iter < iterations; iter++) {
+          // Step A: ランドマーク更新（多視点三角測量）
+          const projs = sfm.keyframes.map(kf => makeProjArray(sfm.k, kf.poseR, kf.poseT));
+          for (const lm of sfm.landmarks) {
+            if (lm.obs.length < 2) continue;
+            const views = lm.obs.map(o => ({ P: projs[o.kfIdx], pt: o.pt }));
+            const newP = triangulateMultiView(views);
+            if (newP && Math.abs(newP[2]) < 80) lm.p = newP;
+          }
+
+          // Step B: 姿勢更新（solvePnPRefineLM）
+          for (let fi = 0; fi < sfm.keyframes.length; fi++) {
+            const kf = sfm.keyframes[fi];
+            if (kf.fixed) continue;
+
+            const objData = [], imgData = [];
+            for (const lm of sfm.landmarks) {
+              const o = lm.obs.find(ob => ob.kfIdx === fi);
+              if (!o) continue;
+              objData.push(lm.p[0], lm.p[1], lm.p[2]);
+              imgData.push(o.pt[0], o.pt[1]);
+            }
+            const n = objData.length / 3;
+            if (n < 6) continue;
+
+            const objPts = cv.matFromArray(n, 1, cv.CV_64FC3, objData);
+            const imgPts = cv.matFromArray(n, 1, cv.CV_32FC2, imgData);
+            const kMat = cv.matFromArray(3, 3, cv.CV_64F, sfm.k);
+            const distCoeffs = cv.Mat.zeros(4, 1, cv.CV_64F);
+            const rMatInit = cv.matFromArray(3, 3, cv.CV_64F, kf.poseR);
+            const rvec = new cv.Mat();
+            cv.Rodrigues(rMatInit, rvec);
+            rMatInit.delete();
+            const tvec = cv.matFromArray(3, 1, cv.CV_64F, kf.poseT);
+            const rMat = new cv.Mat();
+
+            try {
+              cv.solvePnPRefineLM(objPts, imgPts, kMat, distCoeffs, rvec, tvec);
+              cv.Rodrigues(rvec, rMat);
+              const newR = [], newT = [];
+              for (let row = 0; row < 3; row++) {
+                newT.push(tvec.doubleAt(row, 0));
+                for (let col = 0; col < 3; col++) newR.push(rMat.doubleAt(row, col));
+              }
+              kf.poseR = newR;
+              kf.poseT = newT;
+            } catch (_) {}
+
+            objPts.delete(); imgPts.delete(); kMat.delete(); distCoeffs.delete();
+            rvec.delete(); tvec.delete(); rMat.delete();
+          }
+        }
+      }
+
+      // 2フレームから SfM 地図を初期化する（BA対応）
+      // 戻り値: SfM state または null
       function sfmInitFromPair(featsA, featsB, width, height) {
         const matches = matchDescriptors(featsA.descriptors, featsB.descriptors);
         if (matches.length < 24) return null;
@@ -1063,7 +1201,7 @@
         const mask = new cv.Mat();
         const r = new cv.Mat();
         const t = new cv.Mat();
-        let sfmState = null;
+        let sfm = null;
 
         try {
           const E = cv.findEssentialMat(pts1, pts2, k, cv.RANSAC, 0.999, 1.0, 1000, mask);
@@ -1081,8 +1219,11 @@
             ? (row, col) => pts4D.doubleAt(row, col)
             : (row, col) => pts4D.floatAt(row, col);
 
-          const descB = matsToDescs(featsB.descriptors);
-          const mapPts = [];
+          const descsA = matsToDescs(featsA.descriptors);
+          const descsB = matsToDescs(featsB.descriptors);
+          const kpsA = kpsToArray(featsA.keypoints);
+          const kpsB = kpsToArray(featsB.keypoints);
+          const landmarks = [];
 
           for (let i = 0; i < pts4D.cols; i++) {
             if (mask.rows && mask.ucharAt(i, 0) === 0) continue;
@@ -1091,15 +1232,24 @@
             const x = readAt(0, i) / w;
             const y = readAt(1, i) / w;
             const z = readAt(2, i) / w;
-            if (!Number.isFinite(x + y + z) || Math.abs(z) > 80) continue;
+            if (!Number.isFinite(x + y + z) || Math.abs(z) > 80 || z < 0) continue;
+
+            const aIdx = matches[i].queryIdx;
             const bIdx = matches[i].trainIdx;
-            // OpenCV座標系のまま保存（表示時に Three.js 変換: [x, -y, -z]）
-            if (bIdx < descB.length) mapPts.push({ p: [x, y, z], d: descB[bIdx] });
+            if (bIdx >= descsB.length) continue;
+            landmarks.push({
+              p: [x, y, z],
+              d: descsB[bIdx],
+              obs: [
+                { kfIdx: 0, pt: kpsA[aIdx] },
+                { kfIdx: 1, pt: kpsB[bIdx] },
+              ],
+            });
           }
 
           p1.delete(); p2.delete(); triA.delete(); triB.delete(); pts4D.delete();
 
-          if (mapPts.length < 6) return null;
+          if (landmarks.length < 6) return null;
 
           // frame B のカメラ姿勢（world = frame A 原点）
           const poseR = [], poseT = [];
@@ -1108,60 +1258,69 @@
             for (let col = 0; col < 3; col++) poseR.push(r.doubleAt(row, col));
           }
 
-          sfmState = {
-            mapPts,
-            prevKps:   kpsToArray(featsB.keypoints),
-            prevDescs: matsToDescs(featsB.descriptors),
-            poseR,
-            poseT,
+          sfm = {
+            keyframes: [
+              { poseR: [1,0,0, 0,1,0, 0,0,1], poseT: [0,0,0], kps: kpsA, descs: descsA, fixed: true },
+              { poseR, poseT, kps: kpsB, descs: descsB, fixed: false },
+            ],
+            landmarks,
+            k: makeKArray(width, height),
+            width, height,
           };
+
+          // 初期 BA で姿勢と点群を精錬
+          bundleAdjust(sfm, BA_ITERATIONS);
         } finally {
           pts1.delete(); pts2.delete(); k.delete(); mask.delete(); r.delete(); t.delete();
         }
 
-        return sfmState;
+        return sfm;
       }
 
-      // 新フレームを地図に対して solvePnP で位置特定し、新規点を三角測量で追加
-      // 戻り値: { camPosThree, cloud, newSfmState } または null
-      function sfmTrack(sfmState, featsC, width, height) {
-        const { mapPts, prevKps, prevDescs, poseR, poseT } = sfmState;
-        if (mapPts.length < 6) return null;
+      // 新フレームを地図に対して solvePnP で位置特定し、新規点を三角測量で追加。
+      // sfm 状態を直接書き換える（mutate）。戻り値: { camPosThree, cloud, debug } または null。
+      function sfmTrack(sfm, featsC, width, height) {
+        const newKfIdx = sfm.keyframes.length;
+        const kpsC = kpsToArray(featsC.keypoints);
+        const descsC = matsToDescs(featsC.descriptors);
 
-        // 1. 現フレームの記述子を地図とマッチング
-        const mapDescMat = descsToMat(mapPts.map(p => p.d));
-        const mapMatches = matchDescsMat(featsC.descriptors, mapDescMat, 48);
-        mapDescMat.delete();
+        // 1. 現フレームの記述子をランドマーク群とマッチング
+        if (sfm.landmarks.length < 6) return null;
+        const lmDescMat = descsToMat(sfm.landmarks.map(l => l.d));
+        const mapMatches = matchDescsMat(featsC.descriptors, lmDescMat, 48);
+        lmDescMat.delete();
         if (mapMatches.length < 6) return null;
 
-        const currentKps = kpsToArray(featsC.keypoints);
+        // 2. solvePnP + LM で新フレームの絶対姿勢を推定
         const objData = [], imgData = [];
         mapMatches.forEach(m => {
-          const p = mapPts[m.t].p;
-          objData.push(p[0], p[1], p[2]);
-          imgData.push(currentKps[m.q][0], currentKps[m.q][1]);
+          const lm = sfm.landmarks[m.t];
+          objData.push(lm.p[0], lm.p[1], lm.p[2]);
+          imgData.push(kpsC[m.q][0], kpsC[m.q][1]);
         });
 
         const n = mapMatches.length;
-        const objPts    = cv.matFromArray(n, 1, cv.CV_64FC3, objData);
-        const imgPts    = cv.matFromArray(n, 1, cv.CV_32FC2, imgData);
-        const k         = makeCameraMatrix(width, height);
+        const objPts = cv.matFromArray(n, 1, cv.CV_64FC3, objData);
+        const imgPts = cv.matFromArray(n, 1, cv.CV_32FC2, imgData);
+        const kMat = cv.matFromArray(3, 3, cv.CV_64F, sfm.k);
         const distCoeffs = cv.Mat.zeros(4, 1, cv.CV_64F);
-        const rvec      = new cv.Mat();
-        const tvec      = new cv.Mat();
-        const inliers   = new cv.Mat();
-        const rMat      = new cv.Mat();
-        let newPoseR = null, newPoseT = null, camPosThree = null;
-        let dbgInliers = 0;
+        const rvec = new cv.Mat();
+        const tvec = new cv.Mat();
+        const inliersMat = new cv.Mat();
+        const rMat = new cv.Mat();
+
+        let newPoseR = null, newPoseT = null;
+        let inlierCount = 0;
+        const inlierSet = new Set();
 
         try {
           const ok = cv.solvePnPRansac(
-            objPts, imgPts, k, distCoeffs, rvec, tvec, false, 100, 8.0, 0.99, inliers);
-          if (!ok) return null;
-          dbgInliers = inliers.rows;
+            objPts, imgPts, kMat, distCoeffs, rvec, tvec, false, 100, 8.0, 0.99, inliersMat);
+          if (!ok || inliersMat.rows < 6) return null;
+          inlierCount = inliersMat.rows;
+          for (let i = 0; i < inliersMat.rows; i++) inlierSet.add(inliersMat.intAt(i, 0));
 
-          // LM で姿勢を精細化（solvePnPRefineLM）
-          try { cv.solvePnPRefineLM(objPts, imgPts, k, distCoeffs, rvec, tvec); } catch (_) {}
+          try { cv.solvePnPRefineLM(objPts, imgPts, kMat, distCoeffs, rvec, tvec); } catch (_) {}
 
           cv.Rodrigues(rvec, rMat);
           newPoseR = [];
@@ -1170,46 +1329,54 @@
             newPoseT.push(tvec.doubleAt(row, 0));
             for (let col = 0; col < 3; col++) newPoseR.push(rMat.doubleAt(row, col));
           }
-
-          // カメラ中心（世界座標）= -R^T @ t → Three.js に変換 [x, -y, -z]
-          const R = newPoseR, tv = newPoseT;
-          const cx = -(R[0]*tv[0] + R[3]*tv[1] + R[6]*tv[2]);
-          const cy = -(R[1]*tv[0] + R[4]*tv[1] + R[7]*tv[2]);
-          const cz = -(R[2]*tv[0] + R[5]*tv[1] + R[8]*tv[2]);
-          camPosThree = [cx, -cy, -cz];
         } finally {
-          objPts.delete(); imgPts.delete(); k.delete(); distCoeffs.delete();
-          rvec.delete(); tvec.delete(); inliers.delete(); rMat.delete();
+          objPts.delete(); imgPts.delete(); kMat.delete(); distCoeffs.delete();
+          rvec.delete(); tvec.delete(); inliersMat.delete(); rMat.delete();
         }
 
         if (!newPoseR) return null;
 
-        // 2. 前フレーム↔現フレーム間で新規ランドマークを三角測量
-        const k2       = makeCameraMatrix(width, height);
-        const prevRMat = cv.matFromArray(3, 3, cv.CV_64F, poseR);
-        const prevTMat = cv.matFromArray(3, 1, cv.CV_64F, poseT);
-        const newRMat  = cv.matFromArray(3, 3, cv.CV_64F, newPoseR);
-        const newTMat  = cv.matFromArray(3, 1, cv.CV_64F, newPoseT);
-        const p1 = projectionFromPose(k2, prevRMat, prevTMat);
-        const p2 = projectionFromPose(k2, newRMat,  newTMat);
-        prevRMat.delete(); prevTMat.delete(); newRMat.delete(); newTMat.delete(); k2.delete();
+        // 3. 新キーフレームを追加
+        sfm.keyframes.push({
+          poseR: newPoseR, poseT: newPoseT,
+          kps: kpsC, descs: descsC, fixed: false,
+        });
 
-        const prevDescMat = descsToMat(prevDescs);
-        const pcMatches   = matchDescsMat(featsC.descriptors, prevDescMat, 40);
+        // インライアのみ既存ランドマークに観測を追加
+        const usedC = new Set();
+        mapMatches.forEach((m, i) => {
+          if (!inlierSet.has(i)) return;
+          sfm.landmarks[m.t].obs.push({ kfIdx: newKfIdx, pt: kpsC[m.q] });
+          usedC.add(m.q);
+        });
+
+        // 4. 前フレーム↔現フレームで新規ランドマークを三角測量
+        const prevKf = sfm.keyframes[newKfIdx - 1];
+        const prevDescMat = descsToMat(prevKf.descs);
+        const pcMatches = matchDescsMat(featsC.descriptors, prevDescMat, 40);
         prevDescMat.delete();
 
-        const newMapPts = [...mapPts];
-        const currentDescsArr = matsToDescs(featsC.descriptors);
+        const ptsA = [], ptsB = [], triMap = [];
+        pcMatches.forEach(m => {
+          if (usedC.has(m.q)) return;
+          ptsA.push(prevKf.kps[m.t][0], prevKf.kps[m.t][1]);
+          ptsB.push(kpsC[m.q][0], kpsC[m.q][1]);
+          triMap.push({ prevKpIdx: m.t, currKpIdx: m.q });
+        });
 
-        if (pcMatches.length >= 8) {
-          const ptsA = [], ptsB = [];
-          pcMatches.forEach(m => {
-            ptsA.push(prevKps[m.t][0], prevKps[m.t][1]);
-            ptsB.push(currentKps[m.q][0], currentKps[m.q][1]);
-          });
+        if (ptsA.length >= 16) {
+          const kMat2 = cv.matFromArray(3, 3, cv.CV_64F, sfm.k);
+          const prevRMat = cv.matFromArray(3, 3, cv.CV_64F, prevKf.poseR);
+          const prevTMat = cv.matFromArray(3, 1, cv.CV_64F, prevKf.poseT);
+          const newRMat  = cv.matFromArray(3, 3, cv.CV_64F, newPoseR);
+          const newTMat  = cv.matFromArray(3, 1, cv.CV_64F, newPoseT);
+          const p1 = projectionFromPose(kMat2, prevRMat, prevTMat);
+          const p2 = projectionFromPose(kMat2, newRMat, newTMat);
+          prevRMat.delete(); prevTMat.delete(); newRMat.delete(); newTMat.delete(); kMat2.delete();
+
           const triPrev = mat2xN(ptsA);
           const triCurr = mat2xN(ptsB);
-          const pts4D   = new cv.Mat();
+          const pts4D = new cv.Mat();
           try {
             cv.triangulatePoints(p1, p2, triPrev, triCurr, pts4D);
             const readAt = pts4D.type() === cv.CV_64F
@@ -1222,33 +1389,61 @@
               const y = readAt(1, i) / w;
               const z = readAt(2, i) / w;
               if (!Number.isFinite(x + y + z) || Math.abs(z) > 80) continue;
-              const cIdx = pcMatches[i].q;
-              if (cIdx < currentDescsArr.length) newMapPts.push({ p: [x, y, z], d: currentDescsArr[cIdx] });
+              const mp = triMap[i];
+              sfm.landmarks.push({
+                p: [x, y, z],
+                d: descsC[mp.currKpIdx],
+                obs: [
+                  { kfIdx: newKfIdx - 1, pt: prevKf.kps[mp.prevKpIdx] },
+                  { kfIdx: newKfIdx,     pt: kpsC[mp.currKpIdx] },
+                ],
+              });
             }
           } finally {
             triPrev.delete(); triCurr.delete(); pts4D.delete();
+            p1.delete(); p2.delete();
           }
         }
-        p1.delete(); p2.delete();
 
-        // 地図サイズ上限（メモリ節約）
-        const MAX_MAP = 600;
-        if (newMapPts.length > MAX_MAP) newMapPts.splice(0, newMapPts.length - MAX_MAP);
+        // 5. スライディングウィンドウ：古いキーフレームを落として観測インデックスを詰める
+        if (sfm.keyframes.length > SFM_KF_WINDOW) {
+          const drop = sfm.keyframes.length - SFM_KF_WINDOW;
+          sfm.keyframes.splice(0, drop);
+          sfm.landmarks = sfm.landmarks.filter(lm => {
+            lm.obs = lm.obs
+              .filter(o => o.kfIdx >= drop)
+              .map(o => ({ kfIdx: o.kfIdx - drop, pt: o.pt }));
+            return lm.obs.length >= 2;
+          });
+          sfm.keyframes[0].fixed = true; // 新しい先頭をアンカー化
+        }
+
+        // 6. 地図サイズ上限
+        if (sfm.landmarks.length > SFM_MAX_LANDMARKS) {
+          sfm.landmarks.sort((a, b) => {
+            const aRecent = Math.max(...a.obs.map(o => o.kfIdx));
+            const bRecent = Math.max(...b.obs.map(o => o.kfIdx));
+            return (bRecent - aRecent) || (b.obs.length - a.obs.length);
+          });
+          sfm.landmarks.length = SFM_MAX_LANDMARKS;
+        }
+
+        // 7. Bundle Adjustment：多視点三角測量 ↔ solvePnPRefineLM を交互反復
+        bundleAdjust(sfm, BA_ITERATIONS);
+
+        // 8. 最終キーフレームのカメラ中心を返す
+        const finalKf = sfm.keyframes[sfm.keyframes.length - 1];
+        const cam = poseToCamCenter(finalKf.poseR, finalKf.poseT);
 
         return {
-          camPosThree,
-          cloud: newMapPts.map(p => [p.p[0], -p.p[1], -p.p[2]]), // Three.js 座標系
-          newSfmState: {
-            mapPts: newMapPts,
-            prevKps:   currentKps,
-            prevDescs: currentDescsArr,
-            poseR: newPoseR,
-            poseT: newPoseT,
-          },
+          camPosThree: [cam[0], -cam[1], -cam[2]],
+          cloud: sfm.landmarks.map(l => [l.p[0], -l.p[1], -l.p[2]]),
           debug: {
             mapMatches: mapMatches.length,
-            inliers: dbgInliers,
-            tvec: newPoseT.slice(),
+            inliers: inlierCount,
+            landmarks: sfm.landmarks.length,
+            keyframes: sfm.keyframes.length,
+            tvec: finalKf.poseT.slice(),
           },
         };
       }
@@ -1455,15 +1650,15 @@
             if (!sfmState) throw new Error("初期化失敗: 特徴点か視差が不十分です。別の2枚で試してください。");
 
             state.sfm = sfmState;
-            const initCloud = normalizeCloud(sfmState.mapPts.map(p => [p.p[0], -p.p[1], -p.p[2]]));
+            const initCloud = normalizeCloud(sfmState.landmarks.map(l => [l.p[0], -l.p[1], -l.p[2]]));
             renderPointCloud(initCloud);
             updateMetric(els.pointCount,  initCloud.length);
             updateMetric(els.matchCount,  initCloud.length);
             addEstimatedCameraPose([0, 0, 0.2]);
-            logStep(`地図初期化完了 ${initCloud.length}点。カメラを横に動かして次のフレームを追加してください。`);
+            logStep(`地図初期化完了 ${initCloud.length}点（BA適用済み）。カメラを動かして次のフレームを追加してください。`);
 
           } else {
-            // ── 追跡: solvePnP で絶対姿勢を推定 ──
+            // ── 追跡: solvePnP で絶対姿勢を推定 + BA で過去姿勢・点群を再最適化 ──
             const result = sfmTrack(state.sfm, featsB, cur.width, cur.height);
 
             if (!result) {
@@ -1472,9 +1667,8 @@
               return;
             }
 
-            state.sfm = result.newSfmState;
+            // sfmTrack は state.sfm を mutate するので代入不要
 
-            // カメラパスを絶対座標で更新
             const pos = result.camPosThree;
             state.cameraPath.push(pos);
             if (state.cameraPath.length > 32) state.cameraPath.shift();
@@ -1483,9 +1677,9 @@
 
             renderPointCloud(normalizeCloud(result.cloud));
             updateMetric(els.pointCount, result.cloud.length);
-            updateMetric(els.matchCount, result.newSfmState.mapPts.length);
-            const tv = result.debug.tvec;
-            logStep(`追跡 pos[${pos[0].toFixed(4)},${pos[1].toFixed(4)},${pos[2].toFixed(4)}] tvec[${tv[0].toFixed(4)},${tv[1].toFixed(4)},${tv[2].toFixed(4)}] inliers:${result.debug.inliers}/${result.debug.mapMatches}`);
+            updateMetric(els.matchCount, result.debug.landmarks);
+            const d = result.debug;
+            logStep(`追跡 pos[${pos[0].toFixed(3)},${pos[1].toFixed(3)},${pos[2].toFixed(3)}] inliers:${d.inliers}/${d.mapMatches} KF:${d.keyframes} LM:${d.landmarks}`);
           }
 
         } catch (error) {

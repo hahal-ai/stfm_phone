@@ -1,0 +1,13 @@
+# OpenCV source (huge, not needed for web app)
+opencv-4.12.0/
+
+# Build artifacts
+build_wasm/
+
+# npm package
+package/
+techstark-opencv-js-4.12.0-release.1.tgz
+
+# OS
+.DS_Store
+Thumbs.db
