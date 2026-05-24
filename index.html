@@ -1029,13 +1029,18 @@
           const points4D = new cv.Mat();
           cv.triangulatePoints(p1, p2, triA, triB, points4D);
 
+          // p1, p2, triA, triB は CV_64F で作っているので points4D も CV_64F
+          // 万一型が変わっても安全に読めるように doubleAt を優先しつつ float fallback
+          const readAt = points4D.type() === cv.CV_64F
+            ? (row, col) => points4D.doubleAt(row, col)
+            : (row, col) => points4D.floatAt(row, col);
           for (let i = 0; i < points4D.cols; i += 1) {
             if (mask.rows && mask.ucharAt(i, 0) === 0) continue;
-            const w = points4D.floatAt(3, i);
+            const w = readAt(3, i);
             if (Math.abs(w) < 1e-6) continue;
-            const x = points4D.floatAt(0, i) / w;
-            const y = points4D.floatAt(1, i) / w;
-            const z = points4D.floatAt(2, i) / w;
+            const x = readAt(0, i) / w;
+            const y = readAt(1, i) / w;
+            const z = readAt(2, i) / w;
             if (Number.isFinite(x + y + z) && Math.abs(z) < 80) {
               cloud.push([x, -y, -z]);
             }
